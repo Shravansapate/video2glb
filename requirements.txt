@@ -1,0 +1,4 @@
+mediapipe>=0.10.20
+numpy>=1.26
+opencv-python>=4.8
+PyYAML>=6.0

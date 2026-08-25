@@ -1,0 +1,15 @@
+[project]
+name = "video-to-glb"
+version = "0.1.0"
+description = "Milestone-based Indian Sign Language video to animated GLB converter."
+requires-python = ">=3.11"
+dependencies = [
+    "mediapipe>=0.10.20",
+    "numpy>=1.26",
+    "opencv-python>=4.8",
+    "PyYAML>=6.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
