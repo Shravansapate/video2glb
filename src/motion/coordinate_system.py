@@ -15,12 +15,21 @@ def mediapipe_world_to_canonical(points: np.ndarray) -> np.ndarray:
     return converted
 
 
-def mediapipe_image_to_canonical(points: np.ndarray) -> np.ndarray:
+def mediapipe_image_to_canonical(points: np.ndarray, aspect_ratio: float = 1.0) -> np.ndarray:
+    """Convert normalized MediaPipe image coordinates to canonical axes.
+
+    MediaPipe normalizes x by image width and y by image height.  Scaling x
+    (and z, whose landmark scale follows x) by width/height prevents a 16:9
+    frame from shearing body and palm directions before retargeting.
+    """
     points = np.asarray(points, dtype=np.float64)
+    aspect_ratio = float(aspect_ratio)
+    if not np.isfinite(aspect_ratio) or aspect_ratio <= 0.0:
+        raise ValueError("aspect_ratio must be finite and positive")
     converted = np.zeros(points.shape[:-1] + (3,), dtype=np.float64)
-    converted[..., 0] = points[..., 0] - 0.5
+    converted[..., 0] = (points[..., 0] - 0.5) * aspect_ratio
     converted[..., 1] = 0.5 - points[..., 1]
-    converted[..., 2] = -points[..., 2]
+    converted[..., 2] = -points[..., 2] * aspect_ratio
     return converted
 
 

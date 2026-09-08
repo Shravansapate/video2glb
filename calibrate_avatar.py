@@ -26,6 +26,7 @@ def main() -> int:
 
     cmd = [
         str(blender),
+        "--factory-startup",
         "--background",
         "--python",
         str(script),

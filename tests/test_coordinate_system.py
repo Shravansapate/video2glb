@@ -18,6 +18,11 @@ class CoordinateSystemTests(unittest.TestCase):
         np.testing.assert_allclose(converted[0, 0], [0.0, 0.0, -0.1])
         np.testing.assert_allclose(converted[0, 1], [0.5, 0.5, 0.2])
 
+    def test_image_conversion_corrects_normalized_axes_for_aspect_ratio(self):
+        points = np.array([[[1.0, 0.0, 0.25]]])
+        converted = mediapipe_image_to_canonical(points, aspect_ratio=16.0 / 9.0)
+        np.testing.assert_allclose(converted[0, 0], [8.0 / 9.0, 0.5, -4.0 / 9.0])
+
 
 if __name__ == "__main__":
     unittest.main()

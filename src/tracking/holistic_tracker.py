@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 
 from src.tracking.pose_schema import HAND_LANDMARK_COUNT, POSE_LANDMARK_COUNT, PoseFrame, PoseSequence
+from src.tracking.tracking_qc import assess_hand_assignment
 from src.video.inspector import VideoInfo
 
 
@@ -68,37 +69,56 @@ class MediaPipeHolisticBackend(PoseBackend):
 
         writer = _open_overlay_writer(overlay_path, video_info) if overlay_path else None
         frames: list[PoseFrame] = []
-        previous_timestamp_ms = -1
 
         try:
             with HolisticLandmarker.create_from_options(task_options) as landmarker:
-                frame_index = 0
-                while True:
-                    ok, frame_bgr = cap.read()
-                    if not ok:
-                        break
-
-                    timestamp_ms = _timestamp_for_frame(frame_index, video_info.fps, previous_timestamp_ms)
-                    previous_timestamp_ms = timestamp_ms
+                for frame_index, timestamp_ms, frame_bgr in _validated_video_frames(cap, video_info):
 
                     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
                     result = landmarker.detect_for_video(mp_image, timestamp_ms)
                     pose_frame = _result_to_pose_frame(result, frame_index, timestamp_ms)
+                    pose_frame.tracking_quality["hand_assignment"] = assess_hand_assignment(
+                        pose_frame, frames[-1] if frames else None,
+                        aspect_ratio=video_info.width / video_info.height,
+                    )
                     frames.append(pose_frame)
 
                     if writer is not None:
                         writer.write(draw_overlay(frame_bgr, pose_frame, video_info.width, video_info.height))
 
-                    frame_index += 1
-                    if progress and (frame_index == 1 or frame_index % 25 == 0 or frame_index == video_info.frame_count):
-                        progress(frame_index, video_info.frame_count)
+                    completed = frame_index + 1
+                    if progress and (completed == 1 or completed % 25 == 0 or completed == video_info.frame_count):
+                        progress(completed, video_info.frame_count)
         finally:
             cap.release()
             if writer is not None:
                 writer.release()
 
         return PoseSequence(fps=video_info.fps, width=video_info.width, height=video_info.height, frames=frames)
+
+
+def _validated_video_frames(cap: Any, video_info: VideoInfo):
+    """Consume exactly the inspected working timeline or fail the conversion."""
+    timestamps = video_info.timestamps_ms
+    if video_info.variable_frame_rate:
+        raise RuntimeError("Tracking requires the normalized constant-frame-rate working video.")
+    if video_info.frame_count <= 0 or len(timestamps) != video_info.frame_count:
+        raise RuntimeError("Inspected video frame count and timestamp count do not match.")
+    if not np.isfinite(video_info.fps) or video_info.fps <= 0:
+        raise RuntimeError("Tracking requires a finite positive FPS.")
+    if not np.isfinite(timestamps).all() or any(right <= left for left, right in zip(timestamps, timestamps[1:])):
+        raise RuntimeError("Tracking timestamps must be finite and strictly increasing.")
+    for index, timestamp in enumerate(timestamps):
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            raise RuntimeError(f"Incomplete tracking decode: expected {video_info.frame_count} frames, decoded {index}.")
+        if frame.shape[:2] != (video_info.height, video_info.width):
+            raise RuntimeError(f"Tracking frame {index} dimensions differ from inspected video.")
+        yield index, int(timestamp), frame
+    extra, _frame = cap.read()
+    if extra:
+        raise RuntimeError(f"Tracking decoded more than the inspected {video_info.frame_count} frames.")
 
 
 def _result_to_pose_frame(result: Any, frame_index: int, timestamp_ms: int) -> PoseFrame:

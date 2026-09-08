@@ -27,4 +27,5 @@ output:
   save_pose: true
   save_motion: true
   save_debug: true
+  save_intermediates: false
   uppercase_output_dir: true
