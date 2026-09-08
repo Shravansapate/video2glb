@@ -12,7 +12,8 @@ __pycache__/
 /output/
 /failed/
 /logs/
-/input/
+/input/*
+!/input/README.md
 /video/
 .conversion.lock
 
