@@ -1,16 +1,20 @@
 # Input videos
 
-Place your source videos in this `input` folder on your computer.
-Video files are ignored by Git to keep the repository small.
+This folder includes 17 source MP4 videos, including `Train.mp4`, so a clone
+contains the inputs needed for the documented examples. You can also place
+additional MP4 videos here. MP4 files directly in this folder are tracked by
+Git; generated videos elsewhere remain ignored.
+
+Complete the [setup instructions](../README.md#setup-windows) before running.
 
 From PowerShell in the project root (`D:\video2glb` on the original computer),
 run the following using the project's existing Python environment:
 
 ```powershell
-.\.venv\Scripts\python.exe convert.py --video ".\input\Passenger.mp4"
+.\.venv\Scripts\python.exe convert.py --video ".\input\Train.mp4"
 ```
 
-Replace `Passenger.mp4` with your video's filename.
+Replace `Train.mp4` with another video's filename as needed.
 
 To process all supported videos in this folder:
 

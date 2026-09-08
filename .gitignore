@@ -9,7 +9,8 @@ __pycache__/
 # Local processing data, generated exports, and temporary files
 /.tmp_*
 /temp/
-/output/
+/output/*
+!/output/README.md
 /failed/
 /logs/
 /input/*
@@ -25,6 +26,9 @@ __pycache__/
 *.webm
 *.glb
 *.gltf
+
+# Include the source MP4s used by the documented pipeline commands.
+!/input/*.mp4
 
 # Local credentials and environment settings
 .env
