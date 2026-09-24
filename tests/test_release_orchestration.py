@@ -1026,6 +1026,9 @@ def test_new_batch_readiness_uses_nested_production_eligibility(
         production_eligible=nested_eligible,
     )
     monkeypatch.setattr(convert, "PROJECT_ROOT", tmp_path)
+    # The fixture mocks conversion/classification; delivery integrity is tested separately.
+    monkeypatch.setattr(convert, "attach_batch_review", lambda item, *args, **kwargs:
+                        item.update(review_available=True, review_status="PENDING"))
     config_dir = tmp_path / "config"
     config_dir.mkdir(parents=True, exist_ok=True)
     for dependency in (

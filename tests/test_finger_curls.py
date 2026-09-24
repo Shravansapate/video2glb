@@ -7,6 +7,7 @@ from src.motion.skeleton_solver import (
     _build_finger_directions,
     _build_palm_bases,
     _condition_palm_bases,
+    _condition_finger_directions,
     _compute_finger_curls,
     _hold_palm_bases_for_release,
     _hold_last_finger_curls,
@@ -218,6 +219,92 @@ class FingerCurlTests(unittest.TestCase):
 
         angle = math.degrees(math.acos(float(np.clip(np.dot(limited[0, 0, 0, 0], limited[1, 0, 0, 0]), -1.0, 1.0))))
         self.assertAlmostEqual(angle, 30.0, places=6)
+
+    def test_finger_conditioning_rejects_isolated_spike_without_changing_observations(self):
+        directions = self._direction_track([0, 0, 110, 0, 0])
+        observed = np.ones(directions.shape[:-1], dtype=bool)
+        original = directions.copy()
+
+        conditioned, usable, report = _condition_finger_directions(directions, observed, 1, 1)
+
+        np.testing.assert_allclose(conditioned, self._direction_track([0] * 5), atol=1e-7)
+        np.testing.assert_array_equal(directions, original)
+        np.testing.assert_array_equal(observed, usable)
+        self.assertEqual(report["corrected_sample_count"], 1)
+        self.assertEqual(report["sample_corrections"][0]["frame"], 3)
+        self.assertEqual(report["status"], "REVIEW")
+
+    def test_finger_conditioning_preserves_sustained_bend_and_endpoints(self):
+        directions = self._direction_track([0, 0, 80, 80, 80, 80, 80])
+        observed = np.ones(directions.shape[:-1], dtype=bool)
+
+        conditioned, _, report = _condition_finger_directions(directions, observed, 1, 1)
+
+        self.assertEqual(report["corrected_sample_count"], 0)
+        np.testing.assert_allclose(conditioned[3:], directions[3:], atol=1e-7)
+        np.testing.assert_allclose(conditioned[[0, -1]], directions[[0, -1]], atol=1e-7)
+
+    def test_finger_conditioning_preserves_smooth_angular_motion_without_lag(self):
+        directions = self._direction_track(np.arange(0, 91, 10))
+        observed = np.ones(directions.shape[:-1], dtype=bool)
+
+        conditioned, _, report = _condition_finger_directions(directions, observed, 1, 2)
+
+        np.testing.assert_allclose(conditioned, directions, atol=1e-7)
+        self.assertEqual(report["corrected_sample_count"], 0)
+
+    def test_finger_conditioning_fills_only_short_internal_spherical_gaps(self):
+        directions = self._direction_track([0, 0, 0, 40, 0, 0, 80, 0])
+        observed = np.zeros(directions.shape[:-1], dtype=bool)
+        observed[[1, 3, 6]] = True
+        directions[~observed] = np.nan
+        original_mask = observed.copy()
+
+        conditioned, usable, report = _condition_finger_directions(directions, observed, 1, 0)
+
+        np.testing.assert_array_equal(usable[:, 0, 0, 0], [False, True, True, True, False, False, True, False])
+        np.testing.assert_allclose(conditioned[2], self._direction_track([20])[0], atol=1e-7)
+        np.testing.assert_array_equal(observed, original_mask)
+        self.assertTrue(np.isnan(conditioned[[0, 4, 5, 7]]).all())
+        self.assertEqual(report["interpolated_samples"], 1)
+
+    def test_finger_conditioning_does_not_invent_antipodal_gap_arc(self):
+        directions = self._direction_track([0, 0, 180])
+        observed = np.ones(directions.shape[:-1], dtype=bool)
+        observed[1] = False
+        directions[1] = np.nan
+
+        conditioned, usable, _ = _condition_finger_directions(directions, observed, 1, 1)
+
+        self.assertFalse(usable[1].any())
+        self.assertTrue(np.isnan(conditioned[1]).all())
+
+    def test_finger_conditioning_is_invariant_to_time_varying_world_palm_rotation(self):
+        hands = []
+        rotated = []
+        for frame in range(9):
+            hand = self._make_flat_hand(0.0)
+            angle = math.radians(frame * 8)
+            direction = np.array([0.0, math.cos(angle), math.sin(angle)])
+            for index in (6, 7, 8):
+                hand[index] = hand[5] + (index - 5) * direction
+            hands.append(hand)
+            # Deliberately violent palm motion must not shear the local shape.
+            spin = self._z_rotation((-1) ** frame * frame * 55)
+            rotated.append(hand @ spin.T + np.array([frame * 0.3, 2.0, -1.0]))
+        results = []
+        for track in (hands, rotated):
+            directions, observed = _build_finger_directions(np.asarray(track))
+            conditioned, usable, _ = _condition_finger_directions(directions[:, None], observed[:, None], 1, 1)
+            results.append((conditioned, usable))
+
+        np.testing.assert_allclose(results[0][0], results[1][0], atol=1e-7)
+        np.testing.assert_array_equal(results[0][1], results[1][1])
+
+    @staticmethod
+    def _direction_track(degrees):
+        angles = np.radians(degrees)
+        return np.stack([np.sin(angles), np.cos(angles), np.zeros_like(angles)], axis=-1)[:, None, None, None]
 
     def test_reacquired_finger_direction_fades_in(self):
         valid = np.array([[[[False]]], [[[True]]], [[[True]]], [[[True]]], [[[True]]]], dtype=bool)

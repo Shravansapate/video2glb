@@ -90,6 +90,14 @@ def test_declared_frame_count_detects_truncated_input(monkeypatch):
         _inspect(monkeypatch, Capture(), probe)
 
 
+def test_declared_frame_count_tolerates_single_frame_container_rounding(monkeypatch):
+    probe = {"streams": [{"avg_frame_rate": "25/1", "nb_frames": "100"}],
+             "frames": [{"pts_time": str(index / 25)} for index in range(99)]}
+    info = _inspect(monkeypatch, Capture([index / 25 for index in range(99)]), probe)
+    assert info.frame_count == 99
+    assert info.reported_frame_count == 100
+
+
 @pytest.mark.parametrize("fps", [float("nan"), float("inf"), 0.0, -25.0])
 def test_invalid_fps_rejected(monkeypatch, fps):
     with pytest.raises(RuntimeError, match="FPS"):

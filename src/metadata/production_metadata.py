@@ -6,6 +6,8 @@ import importlib.metadata
 import json
 import os
 import re
+import shutil
+import struct
 import tempfile
 import platform
 import tomllib
@@ -350,7 +352,7 @@ def build_production_metadata(
                     "initial_hand_pose", "ending_hand_pose", "neutral_finger_shape", "finger_motion",
                     "finger_retargeting", "palm_orientation", "retargeting",
                     "motion_stability", "root_drift", "full_clip_collision",
-                    "mesh_collision", "mesh_contact_correction", "finger_continuity_correction", "skin_weight_preparation",
+                    "mesh_collision", "mesh_contact_correction", "finger_continuity_correction", "finger_direction_conditioning", "skin_weight_preparation",
                     "required_channel_coverage", "source_depth", "arm_pole_conditioning", "arm_temporal_conditioning",
                 )
             },
@@ -389,6 +391,324 @@ def runtime_versions() -> dict[str, str | None]:
         except importlib.metadata.PackageNotFoundError:
             versions[name] = None
     return versions
+
+
+def write_review_delivery(
+    *,
+    project_root: Path,
+    delivery_dir: Path,
+    source_video: Path,
+    original_glb: Path,
+    run_id: str,
+    batch_id: str,
+    technical_qc: str,
+    validation: dict,
+    metadata: dict | None = None,
+    evidence: dict[str, Path] | None = None,
+    execution: dict | None = None,
+    context_fingerprint: str | None = None,
+    debug_paths: dict[str, Path] | None = None,
+) -> dict:
+    """Copy a verified conversion for human inspection, without approving it.
+
+    The caller verifies the original release/failure manifest before calling.
+    This boundary independently checks source/GLB binding and container shape.
+    Quality failures remain failures; review availability is a separate state.
+    """
+    source_video, original_glb = Path(source_video), Path(original_glb)
+    delivery_dir = Path(delivery_dir)
+    if technical_qc not in {"PASS", "REVIEW", "FAIL"}:
+        raise ValueError("Review delivery requires an actual PASS/REVIEW/FAIL technical result.")
+    source_hash, glb_hash = sha256_file(source_video), sha256_file(original_glb)
+    if not source_hash or not glb_hash:
+        raise ValueError("Review delivery source video or GLB is missing.")
+    if validation.get("validated_glb_sha256") != glb_hash:
+        raise ValueError("Review delivery GLB does not match its validation SHA256.")
+    _check_review_glb(original_glb)
+    execution = deepcopy(execution or {})
+    if execution.get("run_id") not in (None, run_id):
+        raise ValueError("Review delivery execution run does not match conversion run.")
+    assembled_at = utc_now_iso()
+    if metadata is not None and technical_qc != "FAIL":
+        generated = deepcopy(metadata)
+        integrity = generated.get("file_integrity", {})
+        identity = generated.get("asset_identity", {})
+        saved_qc = generated.get("technical_validation", {}).get("technical_qc")
+        if (integrity.get("glb_sha256") != glb_hash
+                or integrity.get("source_video_sha256") != source_hash
+                or identity.get("run_id") != run_id
+                or identity.get("original_filename") != source_video.name
+                or saved_qc != technical_qc):
+            raise ValueError("Review delivery metadata source, GLB, run, filename or QC binding differs.")
+        saved_validation = generated.get("technical_validation", {}).get("glb_validation", {})
+        if saved_validation != validation:
+            raise ValueError("Review delivery metadata validation differs from the bound report.")
+    elif technical_qc == "FAIL":
+        if (execution.get("run_id") != run_id or not execution.get("started_at")
+                or not execution.get("completed_at")):
+            raise ValueError("Review delivery requires the original completed execution record for a failed run.")
+        evidence = {role: Path(path) for role, path in (evidence or {}).items()}
+        required = {"source_video", "avatar", "pose", "motion", "neutral_hand_pose",
+                    "avatar_profile", "bone_map", "video_preparation", "glb_validation"}
+        missing = sorted(role for role in required if role not in evidence or not evidence[role].is_file())
+        if missing:
+            raise ValueError("Review delivery is missing immutable evidence: " + ", ".join(missing))
+        if sha256_file(evidence["source_video"]) != source_hash:
+            raise ValueError("Review delivery source does not match immutable conversion evidence.")
+        def read_evidence(role: str) -> dict:
+            value = json.loads(evidence[role].read_text(encoding="utf-8"))
+            if not isinstance(value, dict):
+                raise ValueError(f"Review delivery {role} evidence is not a JSON object.")
+            return value
+        if read_evidence("glb_validation") != validation:
+            raise ValueError("Review delivery validation differs from immutable conversion evidence.")
+        preparation = read_evidence("video_preparation")
+        neutral = read_evidence("neutral_hand_pose")
+        neutral_validation = deepcopy(neutral.get("validation") or {})
+        neutral_validation["schema_version"] = neutral.get("schema_version")
+        # Do not infer application, tracking results, or approvals from static calibration.
+        neutral_validation["applied"] = None
+        execution.setdefault("run_id", run_id)
+        execution.setdefault("original_filename", source_video.name)
+        execution.setdefault("context_fingerprint", context_fingerprint)
+        source_avatar_path = evidence.get("source_avatar_validation")
+        comparison_path = evidence.get("comparison_video")
+        if source_avatar_path is not None and not source_avatar_path.is_file():
+            raise ValueError("Review delivery source-avatar evidence is missing.")
+        if comparison_path is not None and not comparison_path.is_file():
+            raise ValueError("Review delivery comparison evidence is missing.")
+        source_avatar_report = (
+            read_evidence("source_avatar_validation") if source_avatar_path is not None else
+            {"status": "NOT_RUN", "reasons": ["Not available in failure evidence."]}
+        )
+        generated = build_production_metadata(
+            project_root=project_root, source_video=evidence["source_video"],
+            avatar_file=evidence["avatar"], glb_path=original_glb,
+            pose_path=evidence["pose"], motion_path=evidence["motion"],
+            qc_path=None, glb_validation_path=evidence["glb_validation"],
+            source_avatar_validation_path=source_avatar_path, signer_review_path=None,
+            comparison_video_path=comparison_path,
+            video_info=preparation.get("working") or preparation.get("source") or {},
+            tracking_qc={"technical_qc": "FAIL", "metrics": {}},
+            glb_validation=validation,
+            source_avatar_validation=source_avatar_report,
+            signer_review={"signer_verdict": "PENDING", "isl_verified": False},
+            avatar_profile=read_evidence("avatar_profile"),
+            bone_map=read_evidence("bone_map").get("map", {}),
+            neutral_hand_validation=neutral_validation,
+            neutral_hand_pose_path=evidence["neutral_hand_pose"],
+            started_at=execution.get("started_at"), completed_at=execution.get("completed_at"),
+            logical_identity_stem=source_video.stem, execution_context=execution,
+            preparation=preparation,
+        )
+        generated["technical_validation"]["tracking_summary"] = {
+            "status": "UNAVAILABLE", "reason": "Tracking report was not preserved in immutable failure evidence."
+        }
+        generated["avatar"]["neutral_hand_pose_applied"] = None
+        # The builder runs today, but these fields describe the original conversion.
+        generated["processing"]["pipeline_version"] = execution.get("pipeline_version")
+        generated["processing"]["dependency_versions"] = deepcopy(execution.get("dependency_versions"))
+        generated["processing"]["version_provenance"] = (
+            "Original execution record; unavailable versions are null, not the delivery runtime."
+        )
+    else:
+        raise ValueError("PASS/REVIEW delivery requires complete bound conversion metadata.")
+
+    target_glb = delivery_dir / (source_video.stem + ".glb")
+    target_metadata = delivery_dir / (source_video.stem + ".metadata.json")
+    if target_glb.resolve() == original_glb.resolve():
+        raise ValueError("Review delivery must not overwrite original conversion assets.")
+    original_production = deepcopy(generated.get("production"))
+    original_signer = deepcopy(generated.get("isl_validation"))
+    original_retrieval = deepcopy(generated.get("retrieval"))
+    generated.update(technical_qc=technical_qc, review_status="PENDING", review_available=True)
+    generated["technical_validation"]["technical_qc"] = technical_qc
+    generated["isl_validation"] = {
+        "isl_verified": False, "signer_verdict": "PENDING", "reviewer": None,
+        "reviewed_at": None, "notes": "This inspection copy awaits manual review.",
+    }
+    generated["production"] = {
+        "production_status": "INSPECTION_ONLY", "production_eligible": False,
+        "engineering_candidate": False, "is_active": False, "database_indexed": False,
+        "release_gate": {"status": "INSPECTION_ONLY", "production_eligible": False,
+                         "blockers": ["Inspection delivery is not a production release."]},
+    }
+    for key in ("exact_lookup_enabled", "fuzzy_lookup_enabled", "semantic_search_enabled"):
+        generated.setdefault("retrieval", {})[key] = False
+    generated["delivery"] = {
+        "batch_id": batch_id, "conversion_run_id": run_id, "assembled_at": assembled_at,
+        "title": source_video.stem, "original_filename": source_video.name,
+        "classification": "FAILED_FOR_INSPECTION_ONLY" if technical_qc == "FAIL" else "REVIEW_REQUIRED",
+        "original_glb": path_record(original_glb, project_root),
+        "original_source": path_record(source_video, project_root),
+        "original_production": original_production, "original_isl_validation": original_signer,
+        "original_retrieval": original_retrieval,
+        "immutable_evidence": {role: path_record(path, project_root) for role, path in (evidence or {}).items()},
+        "assembly_runtime_versions": runtime_versions(),
+        "assembly_pipeline_version": _pipeline_version(Path(project_root)),
+        "context_fingerprint": context_fingerprint,
+        "notes": "Review availability does not change technical QC or approve production use.",
+    }
+    existed = target_metadata.exists()
+    if existed:
+        existing = json.loads(target_metadata.read_text(encoding="utf-8"))
+        # Preserve human edits and original assembly time on an identical retry.
+        if (existing.get("file_integrity", {}).get("glb_sha256") != glb_hash
+                or existing.get("file_integrity", {}).get("source_video_sha256") != source_hash
+                or existing.get("delivery", {}).get("conversion_run_id") != run_id
+                or existing.get("technical_qc") != technical_qc
+                or existing.get("technical_validation", {}).get("technical_qc") != technical_qc
+                or existing.get("technical_validation", {}).get("glb_validation") != validation
+                or existing.get("asset_identity", {}).get("original_filename") != source_video.name
+                or existing.get("asset_identity", {}).get("run_id") != run_id
+                or existing.get("production", {}).get("production_eligible") is not False
+                or existing.get("production", {}).get("is_active") is not False
+                or not existing.get("review_status")
+                or existing.get("review_available") is not True):
+            raise ValueError("Review delivery metadata already exists for different conversion evidence.")
+        if sha256_file(target_glb) != glb_hash:
+            raise ValueError("Existing review delivery GLB is missing or changed.")
+        generated = existing
+    else:
+        _copy_review_glb(original_glb, target_glb, glb_hash)
+        generated["assets"]["final_glb"] = path_record(target_glb, project_root)
+    previous_debug = deepcopy(generated.get("review_debug"))
+    generated["review_debug"] = _write_review_debug(
+        project_root=Path(project_root), delivery_dir=delivery_dir, stem=source_video.stem,
+        debug_paths=debug_paths or {}, existing=previous_debug,
+    )
+    if not existed or previous_debug != generated["review_debug"]:
+        atomic_write_json(target_metadata, generated)
+    return {
+        "glb_path": target_glb.resolve().as_posix(),
+        "metadata_path": target_metadata.resolve().as_posix(),
+        "glb_sha256": glb_hash, "metadata_sha256": sha256_file(target_metadata),
+        "review_status": generated["review_status"], "review_available": True,
+        "technical_qc": technical_qc,
+        "review_debug": deepcopy(generated["review_debug"]),
+    }
+
+
+def _write_review_debug(
+    *, project_root: Path, delivery_dir: Path, stem: str,
+    debug_paths: dict[str, Path], existing: dict | None,
+) -> dict:
+    """Add hash-checked debug copies without replacing prior evidence or review notes."""
+    suffixes = {
+        "comparison_video": "_source_avatar_comparison.mp4",
+        "avatar_preview": "_avatar_preview.mp4",
+        "source_avatar_validation": ".source_avatar_validation.json",
+        "pose_overlay": "_pose_overlay.mp4",
+    }
+    unknown = set(debug_paths) - set(suffixes)
+    if unknown:
+        raise ValueError("Unknown review debug role: " + ", ".join(sorted(unknown)))
+    assets = deepcopy((existing or {}).get("assets", {}))
+    originals = deepcopy((existing or {}).get("original_assets", {}))
+    pending = []
+    # Check every old and proposed file before copying anything.
+    for role, record in assets.items():
+        if role not in suffixes or not isinstance(record, dict):
+            raise ValueError("Existing review debug metadata contains an unknown asset.")
+        target = delivery_dir / "debug" / (stem + suffixes[role])
+        if (record.get("absolute_path") != target.resolve().as_posix()
+                or not record.get("sha256") or sha256_file(target) != record["sha256"]):
+            raise ValueError(f"Existing review debug {role} is missing or changed.")
+    for role, path in debug_paths.items():
+        source = Path(path)
+        source_hash = sha256_file(source)
+        if not source_hash:
+            raise ValueError(f"Review debug {role} is missing.")
+        target = delivery_dir / "debug" / (stem + suffixes[role])
+        if target.exists() and sha256_file(target) != source_hash:
+            raise ValueError(f"Review debug {role} already exists with different bytes.")
+        if role in assets and assets[role]["sha256"] != source_hash:
+            raise ValueError(f"Review debug {role} differs from recorded evidence.")
+        if role not in assets:
+            pending.append((role, source, target, source_hash))
+    for role, source, target, source_hash in pending:
+        _copy_review_glb(source, target, source_hash)
+        assets[role] = path_record(target, project_root)
+        originals[role] = path_record(source, project_root)
+    return {
+        "available": bool(assets), "comparison_available": "comparison_video" in assets,
+        "assets": assets, "original_assets": originals,
+    }
+
+
+def _copy_review_glb(source: Path, target: Path, expected_hash: str) -> None:
+    if target.exists():
+        if sha256_file(target) != expected_hash:
+            raise ValueError("Review delivery GLB already exists with different bytes.")
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp", dir=target.parent)
+    try:
+        with os.fdopen(fd, "wb") as out, source.open("rb") as incoming:
+            shutil.copyfileobj(incoming, out)
+            out.flush()
+            os.fsync(out.fileno())
+        if sha256_file(temporary) != expected_hash:
+            raise ValueError("Review delivery GLB changed while being copied.")
+        if target.exists() and sha256_file(target) != expected_hash:
+            raise ValueError("Review delivery GLB was replaced by different bytes during copying.")
+        os.replace(temporary, target)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _check_review_glb(path: Path) -> None:
+    """Bounded container/animation/skin sanity check, not a replacement for QC."""
+    with path.open("rb") as stream:
+        header = stream.read(12)
+        if len(header) != 12:
+            raise ValueError("Review GLB header is truncated.")
+        magic, version, length = struct.unpack("<4sII", header)
+        if magic != b"glTF" or version != 2 or length != path.stat().st_size:
+            raise ValueError("Review GLB is not an intact GLB v2 container.")
+        document = None
+        binary_length = 0
+        while stream.tell() < length:
+            chunk_header = stream.read(8)
+            if len(chunk_header) != 8:
+                raise ValueError("Review GLB chunk header is truncated.")
+            chunk_length, chunk_type = struct.unpack("<II", chunk_header)
+            if chunk_length % 4 or stream.tell() + chunk_length > length:
+                raise ValueError("Review GLB chunk length is invalid.")
+            if document is None:
+                if chunk_type != 0x4E4F534A or chunk_length > 64 * 1024 * 1024:
+                    raise ValueError("Review GLB must begin with a bounded JSON chunk.")
+                document = json.loads(stream.read(chunk_length).decode("utf-8"))
+            else:
+                if chunk_type == 0x4E4F534A:
+                    raise ValueError("Review GLB contains duplicate JSON chunks.")
+                if chunk_type == 0x004E4942 and binary_length:
+                    raise ValueError("Review GLB contains duplicate binary chunks.")
+                if chunk_type == 0x004E4942:
+                    binary_length += chunk_length
+                stream.seek(chunk_length, os.SEEK_CUR)
+    if not isinstance(document, dict) or document.get("asset", {}).get("version") != "2.0":
+        raise ValueError("Review GLB does not declare glTF 2.0.")
+    animations, skins, nodes = document.get("animations", []), document.get("skins", []), document.get("nodes", [])
+    if not binary_length or not animations or not skins or not nodes:
+        raise ValueError("Review GLB has no embedded animated, skinned avatar.")
+    if not any(isinstance(node.get("skin"), int) and 0 <= node["skin"] < len(skins)
+               and isinstance(node.get("mesh"), int) and 0 <= node["mesh"] < len(document.get("meshes", []))
+               for node in nodes):
+        raise ValueError("Review GLB has no mesh bound to a skin.")
+    if not all(skin.get("joints") and all(isinstance(joint, int) and 0 <= joint < len(nodes)
+                                        for joint in skin["joints"]) for skin in skins):
+        raise ValueError("Review GLB has invalid skin joints.")
+    for animation in animations:
+        samplers = animation.get("samplers", [])
+        if not animation.get("channels") or not samplers:
+            raise ValueError("Review GLB has an empty animation.")
+        for channel in animation["channels"]:
+            sampler, node = channel.get("sampler"), channel.get("target", {}).get("node")
+            if (not isinstance(sampler, int) or not 0 <= sampler < len(samplers)
+                    or not isinstance(node, int) or not 0 <= node < len(nodes)):
+                raise ValueError("Review GLB has an invalid animation channel.")
 
 
 def _elapsed_seconds(start: str, end: str) -> float | None:

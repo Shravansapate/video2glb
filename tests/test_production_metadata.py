@@ -1,5 +1,8 @@
 import json
+import struct
 from pathlib import Path
+
+import pytest
 
 from convert import write_reports
 from src.metadata.production_metadata import (
@@ -9,6 +12,7 @@ from src.metadata.production_metadata import (
     merge_metadata,
     normalize_motion_identity,
     sha256_file,
+    write_review_delivery,
 )
 
 
@@ -303,6 +307,345 @@ def test_metadata_records_real_execution_timing_and_unknown_review_fields(tmp_pa
 def _write_asset(path: Path, data: bytes) -> Path:
     path.write_bytes(data)
     return path
+
+
+def _review_fixture(tmp_path: Path, *, failed: bool = False) -> dict:
+    source = _write_asset(tmp_path / "Coach_(Train).mp4", b"original video")
+    document = {
+        "asset": {"version": "2.0"}, "buffers": [{"byteLength": 4}],
+        "nodes": [{"mesh": 0, "skin": 0}, {}], "meshes": [{"primitives": []}],
+        "skins": [{"joints": [1]}], "animations": [{
+            "samplers": [{"input": 0, "output": 1}],
+            "channels": [{"sampler": 0, "target": {"node": 1, "path": "rotation"}}],
+        }],
+    }
+    encoded = json.dumps(document).encode()
+    encoded += b" " * (-len(encoded) % 4)
+    glb_bytes = (struct.pack("<4sII", b"glTF", 2, 32 + len(encoded))
+                 + struct.pack("<II", len(encoded), 0x4E4F534A) + encoded
+                 + struct.pack("<II", 4, 0x004E4942) + b"\x00" * 4)
+    glb = _write_asset(tmp_path / "original.glb", glb_bytes)
+    validation = {"status": "FAIL" if failed else "REVIEW", "animation_count": 1,
+                  "validated_glb_sha256": sha256_file(glb), "reasons": ["Collision"] if failed else []}
+    execution = {"run_id": "a" * 32, "batch_id": "b" * 32,
+                 "started_at": "2026-09-03T08:00:00Z", "completed_at": "2026-09-03T08:01:00Z"}
+    evidence_dir = tmp_path / "immutable"
+    evidence_dir.mkdir()
+    evidence = {
+        "source_video": _write_asset(evidence_dir / "source_video.mp4", source.read_bytes()),
+        "avatar": _write_asset(evidence_dir / "avatar.fbx", b"avatar"),
+        "pose": _write_asset(evidence_dir / "pose.npz", b"pose"),
+        "motion": _write_asset(evidence_dir / "motion.npz", b"motion"),
+    }
+    for role, value in {
+        "neutral_hand_pose": {"schema_version": "1.3", "validation": {"status": "PASS"}},
+        "avatar_profile": {"armature_name": "Avatar", "mesh_names": ["Body"]},
+        "bone_map": {"map": {"LeftHand": "Hand_L", "RightHand": "Hand_R"}},
+        "video_preparation": {"source": {"fps": 29.97, "frame_count": 4},
+                              "working": {"fps": 25.0, "frame_count": 3}},
+        "glb_validation": validation,
+    }.items():
+        evidence[role] = evidence_dir / (role + ".json")
+        atomic_write_json(evidence[role], value)
+    metadata = _build_metadata(
+        tmp_path, source=source, avatar=evidence["avatar"], glb=glb,
+        comparison=tmp_path / "absent.mp4", glb_validation=validation,
+        source_avatar_validation={}, signer_review={}, catalog={},
+        execution_context={**execution, "original_filename": source.name},
+    )
+    metadata["technical_validation"]["technical_qc"] = validation["status"]
+    return {
+        "project_root": tmp_path, "delivery_dir": tmp_path / "delivery" / "COACH_(TRAIN)",
+        "source_video": source, "original_glb": glb, "run_id": "a" * 32,
+        "batch_id": "c" * 32, "technical_qc": validation["status"],
+        "validation": validation, "metadata": None if failed else metadata,
+        "evidence": evidence if failed else None, "execution": execution,
+        "context_fingerprint": "d" * 64,
+    }
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_review_delivery_preserves_bytes_identity_and_actual_qc(tmp_path: Path, failed: bool):
+    args = _review_fixture(tmp_path, failed=failed)
+    result = write_review_delivery(**args)
+    payload = json.loads(Path(result["metadata_path"]).read_text())
+    assert Path(result["glb_path"]).name == "Coach_(Train).glb"
+    assert Path(result["glb_path"]).read_bytes() == args["original_glb"].read_bytes()
+    assert payload["asset_identity"]["original_filename"] == "Coach_(Train).mp4"
+    assert payload["motion_identity"]["gloss"] == "COACH"
+    assert payload["delivery"]["title"] == "Coach_(Train)"
+    assert payload["asset_identity"]["batch_id"] == "b" * 32
+    assert payload["delivery"]["batch_id"] == "c" * 32
+    assert result["technical_qc"] == ("FAIL" if failed else "REVIEW")
+    assert payload["technical_validation"]["technical_qc"] == result["technical_qc"]
+    assert result["review_status"] == "PENDING"
+    assert payload["review_available"] is True
+    assert payload["production"]["production_eligible"] is False
+    assert payload["production"]["is_active"] is False
+    assert payload["retrieval"]["semantic_search_enabled"] is False
+    assert payload["isl_validation"]["signer_verdict"] == "PENDING"
+    assert payload["assets"]["final_glb"]["sha256"] == result["glb_sha256"]
+    if failed:
+        assert payload["assets"]["qc_report"] is None
+        assert payload["assets"]["source_avatar_validation"] is None
+        assert payload["assets"]["signer_review"] is None
+        assert payload["technical_validation"]["tracking_summary"]["status"] == "UNAVAILABLE"
+        assert payload["processing"]["dependency_versions"] is None
+        assert payload["processing"]["pipeline_version"] is None
+        assert payload["delivery"]["assembly_runtime_versions"]["python"]
+        assert payload["delivery"]["classification"] == "FAILED_FOR_INSPECTION_ONLY"
+        assert payload["source"]["source_video_path"]["absolute_path"].endswith("immutable/source_video.mp4")
+        assert payload["video"]["fps"] == 25.0
+        assert payload["video"]["frame_count"] == 3
+
+
+def test_review_delivery_preserves_original_approval_only_as_provenance(tmp_path: Path):
+    args = _review_fixture(tmp_path)
+    args["metadata"]["production"].update(production_status="APPROVED", production_eligible=True)
+    args["metadata"]["isl_validation"].update(isl_verified=True, signer_verdict="PASS")
+    result = write_review_delivery(**args)
+    payload = json.loads(Path(result["metadata_path"]).read_text())
+    assert payload["delivery"]["original_production"]["production_eligible"] is True
+    assert payload["delivery"]["original_isl_validation"]["isl_verified"] is True
+    assert payload["production"]["production_eligible"] is False
+    assert args["metadata"]["production"]["production_eligible"] is True
+
+
+def test_review_delivery_retry_is_idempotent(tmp_path: Path):
+    args = _review_fixture(tmp_path, failed=True)
+    first = write_review_delivery(**args)
+    before = Path(first["metadata_path"]).read_bytes()
+    second = write_review_delivery(**args)
+    assert first == second
+    assert Path(second["metadata_path"]).read_bytes() == before
+    assert list(args["delivery_dir"].glob("*.tmp")) == []
+
+
+def test_review_delivery_new_batch_preserves_original_assembly_and_manual_review(tmp_path: Path):
+    args = _review_fixture(tmp_path, failed=True)
+    first = write_review_delivery(**args)
+    path = Path(first["metadata_path"])
+    payload = json.loads(path.read_text())
+    payload["review_status"] = "CHANGES_REQUESTED"
+    payload["review_notes"] = "Please correct wrist rotation."
+    atomic_write_json(path, payload)
+    before = path.read_bytes()
+    args["batch_id"] = "e" * 32
+    second = write_review_delivery(**args)
+    assert second["review_status"] == "CHANGES_REQUESTED"
+    assert path.read_bytes() == before
+    assert json.loads(path.read_text())["delivery"]["batch_id"] == "c" * 32
+
+
+def _review_debug_fixture(args: dict) -> dict[str, Path]:
+    root = args["project_root"] / "verified_debug"
+    root.mkdir()
+    comparison = _write_asset(root / "comparison.mp4", b"side by side")
+    avatar = _write_asset(root / "avatar.mp4", b"avatar rendering")
+    report = root / "source_avatar_validation.json"
+    atomic_write_json(report, {
+        "status": "REVIEW", "source_video_sha256": sha256_file(args["source_video"]),
+        "comparison_video_sha256": sha256_file(comparison), "source_frame_count": 3,
+    })
+    return {"comparison_video": comparison, "avatar_preview": avatar,
+            "source_avatar_validation": report}
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_review_delivery_copies_available_debug_with_logical_names_and_hashes(tmp_path: Path, failed: bool):
+    args = _review_fixture(tmp_path, failed=failed)
+    args["debug_paths"] = _review_debug_fixture(args)
+    result = write_review_delivery(**args)
+    debug = result["review_debug"]
+    assert debug["available"] is True
+    assert debug["comparison_available"] is True
+    assert len(debug["assets"]) == 3
+    comparison = debug["assets"]["comparison_video"]
+    assert Path(comparison["absolute_path"]).name == "Coach_(Train)_source_avatar_comparison.mp4"
+    assert Path(comparison["absolute_path"]).parent.name == "debug"
+    assert comparison["sha256"] == sha256_file(args["debug_paths"]["comparison_video"])
+    payload = json.loads(Path(result["metadata_path"]).read_text())
+    assert payload["review_debug"] == debug
+    assert payload["technical_qc"] == args["technical_qc"]
+    first_bytes = Path(result["metadata_path"]).read_bytes()
+    assert write_review_delivery(**args) == result
+    assert Path(result["metadata_path"]).read_bytes() == first_bytes
+
+
+def test_review_delivery_debug_upgrade_preserves_human_review_and_original_qc(tmp_path: Path):
+    args = _review_fixture(tmp_path, failed=True)
+    first = write_review_delivery(**args)
+    path = Path(first["metadata_path"])
+    payload = json.loads(path.read_text())
+    del payload["review_debug"]  # Simulate metadata produced before debug delivery support.
+    payload["review_status"] = "CHANGES_REQUESTED"
+    payload["review_notes"] = "Keep this human note."
+    atomic_write_json(path, payload)
+    old_technical = payload["technical_validation"]
+    old_processing = payload["processing"]
+    old_delivery = payload["delivery"]
+    args["debug_paths"] = _review_debug_fixture(args)
+    args["batch_id"] = "e" * 32
+    upgraded = write_review_delivery(**args)
+    after = json.loads(path.read_text())
+    assert upgraded["review_status"] == "CHANGES_REQUESTED"
+    assert after["review_notes"] == "Keep this human note."
+    assert after["technical_validation"] == old_technical
+    assert after["processing"] == old_processing
+    assert after["delivery"] == old_delivery
+    assert after["review_debug"]["comparison_available"] is True
+    args["debug_paths"] = None
+    before = path.read_bytes()
+    write_review_delivery(**args)
+    assert path.read_bytes() == before
+
+
+def test_review_delivery_missing_debug_is_not_marked_available(tmp_path: Path):
+    args = _review_fixture(tmp_path)
+    result = write_review_delivery(**args)
+    assert result["review_debug"]["available"] is False
+    assert result["review_debug"]["comparison_available"] is False
+    assert result["review_debug"]["assets"] == {}
+    args["debug_paths"] = {"comparison_video": tmp_path / "missing.mp4"}
+    with pytest.raises(ValueError, match="debug comparison_video is missing"):
+        write_review_delivery(**args)
+    assert json.loads(Path(result["metadata_path"]).read_text())["review_debug"]["available"] is False
+
+
+@pytest.mark.parametrize("changed", ["copy", "source"])
+def test_review_delivery_debug_refuses_changed_bytes_without_overwriting(tmp_path: Path, changed: str):
+    args = _review_fixture(tmp_path)
+    args["debug_paths"] = _review_debug_fixture(args)
+    result = write_review_delivery(**args)
+    path = Path(result["metadata_path"])
+    metadata_before = path.read_bytes()
+    target = Path(result["review_debug"]["assets"]["comparison_video"]["absolute_path"])
+    if changed == "copy":
+        target.write_bytes(b"changed copy")
+    else:
+        args["debug_paths"]["comparison_video"].write_bytes(b"changed source")
+    copy_before = target.read_bytes()
+    with pytest.raises(ValueError, match="debug"):
+        write_review_delivery(**args)
+    assert target.read_bytes() == copy_before
+    assert path.read_bytes() == metadata_before
+
+
+def test_failed_review_uses_real_immutable_source_avatar_evidence_when_available(tmp_path: Path):
+    args = _review_fixture(tmp_path, failed=True)
+    args["debug_paths"] = _review_debug_fixture(args)
+    args["evidence"].update(args["debug_paths"])
+    result = write_review_delivery(**args)
+    payload = json.loads(Path(result["metadata_path"]).read_text())
+    expected = json.loads(args["debug_paths"]["source_avatar_validation"].read_text())
+    assert payload["technical_validation"]["source_avatar_validation"] == expected
+    assert payload["assets"]["comparison_video"]["sha256"] == expected["comparison_video_sha256"]
+    assert payload["assets"]["source_avatar_validation"]["exists"] is True
+    assert payload["file_integrity"]["comparison_video_sha256"] == expected["comparison_video_sha256"]
+    assert payload["technical_qc"] == "FAIL"
+
+
+@pytest.mark.parametrize("changed", ["nested_qc", "nested_validation", "production"])
+def test_review_delivery_does_not_accept_tampered_qc_or_approval(tmp_path: Path, changed: str):
+    args = _review_fixture(tmp_path, failed=True)
+    result = write_review_delivery(**args)
+    path = Path(result["metadata_path"])
+    payload = json.loads(path.read_text())
+    if changed == "nested_qc":
+        payload["technical_validation"]["technical_qc"] = "PASS"
+    elif changed == "nested_validation":
+        payload["technical_validation"]["glb_validation"]["reasons"] = []
+    else:
+        payload["production"]["production_eligible"] = True
+    atomic_write_json(path, payload)
+    before = path.read_bytes()
+    with pytest.raises(ValueError):
+        write_review_delivery(**args)
+    assert path.read_bytes() == before
+
+
+def test_failed_review_delivery_requires_completed_execution_evidence(tmp_path: Path):
+    args = _review_fixture(tmp_path, failed=True)
+    args["execution"] = None
+    with pytest.raises(ValueError, match="completed execution"):
+        write_review_delivery(**args)
+
+
+@pytest.mark.parametrize("changed", ["source", "glb", "run", "qc", "validation"])
+def test_review_delivery_rejects_unbound_metadata(tmp_path: Path, changed: str):
+    args = _review_fixture(tmp_path)
+    if changed == "source":
+        args["source_video"].write_bytes(b"changed")
+    elif changed == "glb":
+        args["validation"]["validated_glb_sha256"] = "0" * 64
+    elif changed == "run":
+        args["metadata"]["asset_identity"]["run_id"] = "wrong"
+    elif changed == "qc":
+        args["metadata"]["technical_validation"]["technical_qc"] = "PASS"
+    else:
+        args["validation"]["reasons"].append("changed")
+    with pytest.raises(ValueError):
+        write_review_delivery(**args)
+    assert not args["delivery_dir"].exists()
+
+
+@pytest.mark.parametrize("changed", ["missing", "source", "validation"])
+def test_review_delivery_rejects_incomplete_or_mismatched_failure_evidence(tmp_path: Path, changed: str):
+    args = _review_fixture(tmp_path, failed=True)
+    if changed == "missing":
+        del args["evidence"]["pose"]
+    elif changed == "source":
+        args["evidence"]["source_video"].write_bytes(b"changed")
+    else:
+        atomic_write_json(args["evidence"]["glb_validation"], {"status": "PASS"})
+    with pytest.raises(ValueError):
+        write_review_delivery(**args)
+    assert not args["delivery_dir"].exists()
+
+
+def test_review_delivery_rejects_invalid_container_even_with_matching_hash(tmp_path: Path):
+    args = _review_fixture(tmp_path)
+    args["original_glb"].write_bytes(b"not an animated GLB")
+    args["validation"]["validated_glb_sha256"] = sha256_file(args["original_glb"])
+    with pytest.raises(ValueError, match="GLB"):
+        write_review_delivery(**args)
+
+
+@pytest.mark.parametrize("missing", ["animations", "skins"])
+def test_review_delivery_rejects_glb_without_skeletal_animation(tmp_path: Path, missing: str):
+    args = _review_fixture(tmp_path)
+    original = args["original_glb"].read_bytes()
+    json_length = struct.unpack("<I", original[12:16])[0]
+    document = json.loads(original[20:20 + json_length])
+    del document[missing]
+    encoded = json.dumps(document).encode()
+    encoded += b" " * (-len(encoded) % 4)
+    args["original_glb"].write_bytes(
+        struct.pack("<4sII", b"glTF", 2, 32 + len(encoded))
+        + struct.pack("<II", len(encoded), 0x4E4F534A) + encoded
+        + struct.pack("<II", 4, 0x004E4942) + b"\x00" * 4
+    )
+    args["validation"]["validated_glb_sha256"] = sha256_file(args["original_glb"])
+    with pytest.raises(ValueError, match="animated, skinned"):
+        write_review_delivery(**args)
+
+
+@pytest.mark.parametrize("target", ["glb", "metadata"])
+def test_review_delivery_does_not_overwrite_other_evidence(tmp_path: Path, target: str):
+    args = _review_fixture(tmp_path)
+    result = write_review_delivery(**args)
+    if target == "glb":
+        path = Path(result["glb_path"])
+        path.write_bytes(b"different output")
+    else:
+        path = Path(result["metadata_path"])
+        value = json.loads(path.read_text())
+        value["delivery"]["conversion_run_id"] = "another run"
+        atomic_write_json(path, value)
+    before = path.read_bytes()
+    with pytest.raises(ValueError):
+        write_review_delivery(**args)
+    assert path.read_bytes() == before
 
 
 def _build_metadata(

@@ -163,6 +163,18 @@ def main() -> int:
         "sample_corrections": corrections[:32],
         "reference_fps": 25.0, "maximum_step_degrees_at_reference_fps": 24.0,
     }
+    planned_returns = [record for details in finger_constraints.values()
+                       for record in details.get("planned_neutral_transitions", [])]
+    ik_calibration["planned_neutral_transition"] = {
+        "status": "REVIEW" if planned_returns else "NOT_APPLIED",
+        "method": "verified_anchored_monotonic_palm_local_slerp",
+        "sample_count": len(planned_returns),
+        "maximum_step_degrees": max((record["step_degrees"] for record in planned_returns), default=0.0),
+        "maximum_previous_plan_error_degrees": max((record["previous_plan_error_degrees"] for record in planned_returns), default=0.0),
+        "sample_transitions": planned_returns[:32],
+        "live_tracking_step_limit_unchanged": True,
+        "post_export_validation_required": True,
+    }
     if ik_targets is not None and finger_directions is not None:
         from src.blender.mesh_contact import correct_baked_torso_contacts
         ik_calibration["mesh_contact_correction"] = correct_baked_torso_contacts(armature, bone_map, frame_count, fps)
@@ -524,6 +536,15 @@ def update_finger_targets(
 
         for finger_index, segments in details["fingers"].items():
             for segment_index, segment in enumerate(segments):
+                neutral_weight = float(neutral_weights[side_index]) if neutral_weights is not None else 0.0
+                neutral_rotation = segment.get("neutral_palm_rotation")
+                previous_weight = segment.get("previous_neutral_weight", 0.0)
+
+                # Seed previous_palm_rotation from neutral_rotation when available,
+                # either on initial frame or immediately when neutral release occurs.
+                if previous_weight > 0.0 and neutral_weight <= 0.0 and neutral_rotation is not None:
+                    segment["previous_palm_rotation"] = neutral_rotation.copy()
+
                 is_valid = bool(valid[side_index, finger_index, segment_index]) if valid is not None else np.isfinite(directions[side_index, finger_index, segment_index]).all()
                 influence = float(influences[side_index, finger_index, segment_index]) if influences is not None else float(is_valid)
                 if not np.isfinite(influence) or not 0.0 <= influence <= 1.0:
@@ -541,7 +562,10 @@ def update_finger_targets(
                     base = hand_rotation @ prior_final
                 if not direction_is_finite or influence <= 0.0:
                     if segment["previous_palm_rotation"] is None:
-                        segment["previous_palm_rotation"] = hand_rotation.inverted() @ base
+                        segment["previous_palm_rotation"] = (
+                            neutral_rotation.copy() if neutral_rotation is not None
+                            else (hand_rotation.inverted() @ base).normalized()
+                        )
                     final_rotation = base
                 else:
                     source_direction = Vector(directions[side_index, finger_index, segment_index])
@@ -550,21 +574,22 @@ def update_finger_targets(
                         raise RuntimeError(f"Degenerate {side} finger direction at frame {frame}.")
                     previous = segment["previous_palm_rotation"]
                     if previous is None:
-                        previous = hand_rotation.inverted() @ base
+                        previous = (
+                            neutral_rotation.copy() if neutral_rotation is not None
+                            else (hand_rotation.inverted() @ base).normalized()
+                        )
                     current_direction = previous @ Vector((0.0, 1.0, 0.0))
                     swing = current_direction.rotation_difference(local_direction.normalized())
                     transported = (swing @ previous).normalized()
                     segment["previous_palm_rotation"] = transported
                     target_rotation = hand_rotation @ transported
                     final_rotation = base.slerp(target_rotation, influence)
-                neutral_weight = float(neutral_weights[side_index]) if neutral_weights is not None else 0.0
-                neutral_rotation = segment.get("neutral_palm_rotation")
+
                 if neutral_weight > 0.0 and neutral_rotation is not None:
                     # Blend entire evaluated orientations in one palm frame.
                     # Blending each local ancestor independently compounds into
                     # a much larger distal turn during the neutral transition.
                     tracked_rotation = segment["previous_palm_rotation"]
-                    previous_weight = segment.get("previous_neutral_weight", 0.0)
                     if neutral_weight > previous_weight and segment.get("neutral_exit_anchor") is None:
                         segment["neutral_exit_anchor"] = (prior_final or tracked_rotation).copy()
                     if neutral_weight < previous_weight:
@@ -574,12 +599,34 @@ def update_finger_targets(
                     final_rotation = hand_rotation @ tracked_rotation.slerp(neutral_rotation, neutral_weight)
                 else:
                     segment["neutral_exit_anchor"] = None
+
                 segment["previous_neutral_weight"] = neutral_weight
                 final_local = (hand_rotation.inverted() @ final_rotation).normalized()
                 if prior_final is not None:
                     angle = 2.0 * float(np.arccos(np.clip(abs(prior_final.dot(final_local)), 0.0, 1.0)))
                     maximum = details.get("maximum_rotation_step", np.radians(24.0))
-                    if angle > maximum:
+
+                    anchor = segment.get("neutral_exit_anchor")
+                    planned_return = False
+                    weight_step = neutral_weight - previous_weight
+                    # An anchored ending return already follows one continuous
+                    # shortest arc. Re-limiting each sample makes that scheduled
+                    # return miss its declared fully-neutral endpoint. Exempt
+                    # only an intact monotonic plan, never a sudden jump, an
+                    # initial fade, or a source-tracking/recovery rotation.
+                    if anchor is not None and neutral_rotation is not None and 0.0 < weight_step <= 0.25 + 1e-7:
+                        prior_planned = anchor.slerp(neutral_rotation, previous_weight)
+                        prior_error = 2.0 * float(np.arccos(np.clip(abs(prior_final.dot(prior_planned)), 0.0, 1.0)))
+                        full_angle = 2.0 * float(np.arccos(np.clip(abs(anchor.dot(neutral_rotation)), 0.0, 1.0)))
+                        planned_step = full_angle * weight_step
+                        planned_return = prior_error <= np.radians(0.1) and angle <= planned_step + np.radians(0.1)
+                        if planned_return:
+                            details.setdefault("planned_neutral_transitions", []).append({
+                                "frame": frame, "side": side, "bone": segment["bone_name"],
+                                "weight": neutral_weight, "step_degrees": float(np.degrees(angle)),
+                                "previous_plan_error_degrees": float(np.degrees(prior_error)),
+                            })
+                    if angle > maximum and not planned_return:
                         final_local = prior_final.slerp(final_local, maximum / angle).normalized()
                         final_rotation = hand_rotation @ final_local
                         details.setdefault("continuity_corrections", []).append({

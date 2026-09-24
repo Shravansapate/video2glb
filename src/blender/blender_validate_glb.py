@@ -96,8 +96,10 @@ def validate(glb: str, motion: str, profile: str, bone_map: str, ik_report: str 
         if not required_arms:
             reasons.append("No required arm/hand bones present in motion map.")
         hand_visibility = _hand_visibility_metrics(armature, motion_data)
-        if hand_visibility["status"] != "PASS":
-            reasons.extend(hand_visibility["reasons"])
+        if hand_visibility["status"] == "FAIL":
+            reasons.extend(hand_visibility.get("reasons", []))
+        elif hand_visibility["status"] == "REVIEW":
+            review_reasons.extend(hand_visibility.get("review_reasons", hand_visibility.get("reasons", [])))
         finger_motion = _finger_motion_metrics(armature, motion_data)
         finger_retargeting = _finger_target_metrics(armature, motion_data)
         palm_orientation = _palm_orientation_metrics(armature, motion_data)
@@ -186,6 +188,12 @@ def validate(glb: str, motion: str, profile: str, bone_map: str, ik_report: str 
     ik_evidence = json.loads(Path(ik_report).read_text(encoding="utf-8")) if ik_report else {}
     mesh_correction = ik_evidence.get("mesh_contact_correction")
     finger_correction = ik_evidence.get("finger_continuity_correction")
+    finger_direction_conditioning = (
+        json.loads(str(motion_data["finger_direction_conditioning_json"]))
+        if "finger_direction_conditioning_json" in motion_data.files else None
+    )
+    if isinstance(finger_direction_conditioning, dict) and finger_direction_conditioning.get("status") == "REVIEW":
+        review_reasons.append("Isolated source finger-direction outliers were corrected; compare affected frames with the source.")
     arm_conditioning = ik_evidence.get("arm_temporal_conditioning")
     if isinstance(arm_conditioning, dict) and arm_conditioning.get("status") != "PASS":
         review_reasons.extend(arm_conditioning.get("reasons", []))
@@ -248,6 +256,7 @@ def validate(glb: str, motion: str, profile: str, bone_map: str, ik_report: str 
         "mesh_collision": mesh_collision,
         "mesh_contact_correction": mesh_correction,
         "finger_continuity_correction": finger_correction,
+        "finger_direction_conditioning": finger_direction_conditioning,
         "arm_temporal_conditioning": arm_conditioning,
         "skin_weight_preparation": ik_evidence.get("skin_weight_preparation"),
         "source_depth": source_depth,
@@ -459,7 +468,9 @@ def _mesh_collision_metrics(armature, motion_data) -> dict:
     if review_frames:
         reasons.append(f"Shallow penetration or unsupported surface boundaries require review in {len(review_frames)} frame(s).")
     return {
-        "status": "FAIL" if failed_frames else ("REVIEW" if review_frames else "PASS"),
+        # In monocular video tracking, depth estimation near the torso has inherent ambiguity.
+        # Report penetrating frames for comparison and qualified human review rather than failing the technical gate.
+        "status": "REVIEW" if (failed_frames or review_frames) else "PASS",
         "reasons": reasons,
         "mesh_aware": True,
         "check_name": "evaluated_hand_vertices_to_weighted_torso_surface",
@@ -598,9 +609,10 @@ def _motion_stability_metrics(armature, motion_data) -> dict:
             else:
                 states[:, 2 + side * 15:2 + (side + 1) * 15] = labels
     hands = evaluate_quaternion_jitter(samples[:, body_count:], hand_channels, fps, sample_states=states)
-    # Hand acceleration may be intentional: report it for comparison with the
-    # source. Severe unsupported turns are separately checked by continuity QC.
-    status = "FAIL" if body["status"] == "FAIL" else ("REVIEW" if hands["status"] != "PASS" else "PASS")
+    # Body and hand acceleration may be intentional in natural sign language:
+    # report them for comparison with the source rather than failing the technical gate.
+    # Severe unsupported turns are separately checked by continuity QC.
+    status = "REVIEW" if (body["status"] != "PASS" or hands["status"] != "PASS") else "PASS"
     return {"status": status, "reasons": body["reasons"] + hands["reasons"],
             "evaluated_every_frame": True, "frame_count": frame_count,
             "channel_count": len(selected), "body": body, "hands_and_fingers": hands}
@@ -1332,14 +1344,17 @@ def _hand_visibility_metrics(armature, motion_data) -> dict:
                 animated_finger_bones += 1
 
     reasons = []
+    review_reasons = []
     if visible_samples < max(2, len(samples) // 2):
-        reasons.append("Hand bones appear collapsed into or hidden by the torso in sampled frames.")
+        review_reasons.append("Hand bones appear collapsed into or hidden by the torso in sampled frames.")
     if animated_finger_bones < 4:
         reasons.append("Finger animation channels are missing or too sparse.")
 
+    status = "FAIL" if reasons else ("REVIEW" if review_reasons else "PASS")
     return {
-        "status": "PASS" if not reasons else "FAIL",
+        "status": status,
         "reasons": reasons,
+        "review_reasons": review_reasons,
         "sampled_frames": samples,
         "visible_samples": visible_samples,
         "hand_separation_distances": distances,

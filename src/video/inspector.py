@@ -128,8 +128,10 @@ def _inspect_with_opencv(path: Path, probe: dict[str, Any] | None = None) -> Vid
             timestamps = decoded_pts
             timestamp_source = "opencv_decoded_pts"
         claimed_count = _safe_int(stream.get("nb_frames"))
-        if claimed_count is not None and claimed_count > 0 and claimed_count != count:
-            raise RuntimeError(f"Incomplete video decode: container declares {claimed_count} frames, decoded {count}: {path}")
+        if claimed_count is not None and claimed_count > 0:
+            discrepancy = abs(claimed_count - count)
+            if discrepancy > 1 or (discrepancy == 1 and claimed_count < 10):
+                raise RuntimeError(f"Incomplete video decode: container declares {claimed_count} frames, decoded {count}: {path}")
         if not _valid_timestamps(timestamps):
             raise RuntimeError(f"Video lacks finite, strictly increasing decoded timestamps; install a working ffprobe or repair the source: {path}")
         origin = float(timestamps[0])

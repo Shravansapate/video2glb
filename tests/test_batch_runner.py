@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from threading import Barrier, Event, Lock
 import time
 
 import pytest
@@ -228,3 +229,169 @@ def test_batch_resource_limits_are_enforced(
             timeout_seconds=timeout,
             retries=retries,
         )
+
+
+def test_twenty_video_batch_bounds_workers_reports_progress_and_continues_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A 20-file batch uses two slots, not 20 simultaneous conversion processes."""
+    lock = Lock()
+    first_workers = Barrier(2)
+    active = peak_active = 0
+    calls: list[tuple[str, int]] = []
+    dispatched: list[str] = []
+    completed: list[str] = []
+
+    def worker(command, *, attempt_number, log_path, **_kwargs):
+        nonlocal active, peak_active
+        key = command[-1]
+        with lock:
+            active += 1
+            peak_active = max(peak_active, active)
+            calls.append((key, attempt_number))
+        try:
+            if key in {"video-00", "video-01"}:
+                first_workers.wait(timeout=5)
+            time.sleep(0.005)
+            if key == "video-03":
+                raise RuntimeError("isolated worker defect")
+            failed_qc = key in {"video-00", "video-07", "video-19"}
+            return ProcessAttempt(
+                attempt=attempt_number,
+                returncode=1 if failed_qc else 0,
+                timed_out=False,
+                duration_seconds=0.005,
+                log_path=log_path,
+                failure_category="TECHNICAL_QC" if failed_qc else None,
+                retryable=False,
+            )
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(batch_runner, "_run_command_once", worker)
+    jobs = [
+        BatchJob(f"video-{i:02d}", ("worker", f"video-{i:02d}"), f"video-{i:02d}", "context-hash")
+        for i in range(20)
+    ]
+    results = batch_runner.run_isolated_jobs(
+        jobs, cwd=tmp_path, log_dir=tmp_path / "logs", max_workers=2,
+        timeout_seconds=10, retries=3,
+        on_dispatch=lambda job: dispatched.append(job.key),
+        on_result=lambda result: completed.append(result.key),
+    )
+
+    assert peak_active == 2
+    assert active == 0
+    assert dispatched == [job.key for job in jobs]
+    assert sorted(completed) == sorted(dispatched)
+    assert len(completed) == 20
+    assert [result.key for result in results] == dispatched
+    assert len(calls) == 20  # Neither deterministic QC failures nor worker defects are retried.
+    assert all(number == 1 for _key, number in calls)
+    assert [result.key for result in results if result.returncode] == [
+        "video-00", "video-03", "video-07", "video-19",
+    ]
+    assert results[3].attempts[0].failure_category == "WORKER_ERROR"
+    assert "isolated worker defect" in results[3].attempts[0].log_path.read_text(encoding="utf-8")
+    assert all(result.attempts[0].context_fingerprint == "context-hash" for result in results)
+    assert len({result.attempts[0].log_path for result in results}) == 20
+
+
+def test_transient_retries_stop_at_configured_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    attempts: list[int] = []
+    delays: list[float] = []
+
+    def worker(_command, *, attempt_number, **_kwargs):
+        attempts.append(attempt_number)
+        return _attempt(tmp_path, number=attempt_number, returncode=124, timed_out=True, retryable=True)
+
+    monkeypatch.setattr(batch_runner, "_run_command_once", worker)
+    monkeypatch.setattr(batch_runner.time, "sleep", delays.append)
+    result = batch_runner._run_job(
+        BatchJob("video", ("worker",), "video"), cwd=tmp_path,
+        log_dir=tmp_path, timeout_seconds=10, retries=3,
+    )
+
+    assert attempts == [1, 2, 3, 4]
+    assert delays == [1, 2, 4]
+    assert result.returncode == 124
+    assert result.timed_out is True
+
+
+@pytest.mark.parametrize(
+    ("message", "returncode", "category", "retryable"),
+    [
+        ("FAIL: GLB validation failed: finger jump", 1, "TECHNICAL_QC", False),
+        ('{"technical_qc": "FAIL"}', 1, "TECHNICAL_QC", False),
+        ("QC failed: wrist/body collision", 1, "TECHNICAL_QC", False),
+        ("No decodable frames", 1, "INVALID_INPUT", False),
+        ("ModuleNotFoundError: no module named bpy", 1, "DEPENDENCY_MISSING", False),
+        ("Pipeline context changed", 1, "CONTEXT_CHANGED", False),
+        ("MemoryError: out of memory", 1, "RESOURCE_EXHAUSTED", True),
+        ("Resource temporarily unavailable", 1, "RESOURCE_EXHAUSTED", True),
+        ("Unknown conversion error", 1, "CONVERSION_ERROR", False),
+        ("Review required", 2, None, False),
+        ("Success", 0, None, False),
+        ("Interrupted", 130, "INTERRUPTED", False),
+    ],
+)
+def test_failure_classification_retries_only_identified_transient_errors(
+    tmp_path: Path, message: str, returncode: int, category: str | None, retryable: bool,
+):
+    log_path = tmp_path / "worker.log"
+    log_path.write_text(message, encoding="utf-8")
+    assert batch_runner.classify_process_failure(
+        returncode, timed_out=False, log_path=log_path,
+    ) == (category, retryable)
+
+
+def test_pausing_two_worker_batch_drains_active_jobs_without_dispatching_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    initial_workers = Barrier(2)
+    first_completed = Event()
+    dispatched: list[str] = []
+    completed: list[str] = []
+    pauses: list[str] = []
+
+    def worker(command, *, attempt_number, **_kwargs):
+        initial_workers.wait(timeout=5)
+        if command[-1] == "1":
+            assert first_completed.wait(timeout=5)
+        return _attempt(tmp_path, number=attempt_number, returncode=0)
+
+    def record_result(result):
+        completed.append(result.key)
+        first_completed.set()
+
+    monkeypatch.setattr(batch_runner, "_run_command_once", worker)
+    results = batch_runner.run_isolated_jobs(
+        [BatchJob(str(i), ("worker", str(i)), str(i)) for i in range(20)],
+        cwd=tmp_path, log_dir=tmp_path / "logs", max_workers=2,
+        timeout_seconds=10, retries=0,
+        on_dispatch=lambda job: dispatched.append(job.key), on_result=record_result,
+        should_pause=lambda: "checkpoint requested" if completed else None,
+        on_pause=pauses.append,
+    )
+
+    assert dispatched == ["0", "1"]
+    assert completed == ["0", "1"]
+    assert [result.key for result in results] == ["0", "1"]
+    assert pauses == ["checkpoint requested"]
+
+
+def test_flat_twenty_video_batch_does_not_reprocess_nested_test_copies(tmp_path: Path):
+    nested = tmp_path / "previous-test-copies"
+    nested.mkdir()
+    for index in range(20):
+        name = f"Video_{index:02d}.mp4"
+        (tmp_path / name).write_bytes(b"video")
+        (nested / name).write_bytes(b"previous test copy")
+
+    videos = batch_runner.discover_mp4_files(tmp_path, recursive=False)
+
+    assert len(videos) == 20
+    assert all(video.parent == tmp_path for video in videos)
+    assert [video.name for video in videos] == [f"Video_{index:02d}.mp4" for index in range(20)]

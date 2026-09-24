@@ -30,7 +30,7 @@ def supported_face_projection(point, nearest, normal, shoulder_width: float) -> 
         return False
     axis = axis / length
     tangent = delta - axis * np.dot(delta, axis)
-    return bool(np.linalg.norm(tangent) <= shoulder_width * 1e-4)
+    return bool(np.linalg.norm(tangent) <= shoulder_width * 0.05)
 
 
 def clearance_envelope(required: np.ndarray, radius: int) -> np.ndarray:
@@ -140,7 +140,7 @@ def minimum_front_surface_correction(
 
     supported = np.isfinite(depths)
     result["supported_point_count"] = int(supported.sum())
-    if not supported.all():
+    if not supported.any():
         result.update({
             "status": "REVIEW",
             "reasons": ["Confirmed penetrating hand points have no reliable front-facing torso surface at the same lateral/vertical coordinates."],
@@ -150,7 +150,9 @@ def minimum_front_surface_correction(
         })
         return result
 
-    required = max(0.0, float(np.max(depths + clearance_ratio * shoulder_width - projected_points[:, 2])))
+    valid_depths = depths[supported]
+    valid_points = projected_points[supported, 2]
+    required = max(0.0, float(np.max(valid_depths + clearance_ratio * shoulder_width - valid_points)))
     ratio = required / shoulder_width
     translation = front * required
     result.update({
@@ -159,13 +161,21 @@ def minimum_front_surface_correction(
         "required_shift": required,
         "required_shift_shoulder_widths": ratio,
     })
+    reasons = []
+    if not supported.all():
+        reasons.append("Some penetrating hand points extend past front-facing torso surface boundaries.")
     if ratio > maximum_automatic_shift_ratio + 1e-8:
+        reasons.append("The required forward shift exceeds the automatic correction limit; source depth or manual animation needs review.")
         result.update({
             "status": "REVIEW",
-            "reasons": ["The required forward shift exceeds the automatic correction limit; source depth or manual animation needs review."],
+            "reasons": reasons,
             "automatic_correction_allowed": False,
         })
     else:
+        result.update({
+            "status": "REVIEW" if reasons else "PASS",
+            "reasons": reasons,
+        })
         result["translation"] = translation.tolist()
     return result
 

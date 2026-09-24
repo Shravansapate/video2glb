@@ -117,7 +117,7 @@ class TorsoContactSampler:
                         penetrating[index] = True
             reports.append(minimum_front_surface_correction(
                 points, all_vertices, np.asarray(all_faces, dtype=np.int64), np.asarray(front), width,
-                penetrating_mask=penetrating, maximum_automatic_shift_ratio=0.30, clearance_ratio=0.003,
+                penetrating_mask=penetrating, maximum_automatic_shift_ratio=0.30, clearance_ratio=0.015,
             ))
         return reports, np.asarray(front), width
 
@@ -194,14 +194,10 @@ def _correct_contact_pass(armature, mapping, frame_count, fps, already_shifted):
             if not result["reachable"]:
                 record = {"frame": index + 1, "side": side, "endpoint_error": result["endpoint_error"],
                           "endpoint_error_normalized": result["endpoint_error_normalized"]}
-                # Fully extended source arms cannot move deeper at identical
-                # image-plane coordinates. A small, explicitly recorded nearest
-                # feasible endpoint avoids both arm stretching and a hard jump
-                # from dropping the correction on those boundary frames.
-                if result["endpoint_error_normalized"] > 0.025:
+                projected.append(record)
+                if result["endpoint_error_normalized"] > 0.08:
                     unreachable.append(record)
                     continue
-                projected.append(record)
             desired_elbow, desired_wrist = Vector(result["elbow"]), Vector(result["wrist"])
             upper_swing = (elbow - shoulder).rotation_difference(desired_elbow - shoulder)
             target = (upper_swing.to_matrix() @ upper_matrix.to_3x3()).to_4x4()

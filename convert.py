@@ -27,6 +27,7 @@ from src.metadata.production_metadata import (
     runtime_versions,
     sha256_file,
     utc_now_iso,
+    write_review_delivery,
 )
 from src.motion.neutral_hand import ensure_neutral_hand_pose
 from src.motion.skeleton_solver import MotionBuildResult, solve_motion_from_pose
@@ -44,7 +45,9 @@ from src.pipeline.batch_runner import (
 from src.qc.gltf_compliance import classify_gltf_validator_report
 from src.qc.production_gate import evaluate_production_gate
 from src.qc.signer_approval import verify_signer_approval
-from src.qc.source_avatar_comparison import create_source_avatar_comparison
+from src.qc.source_avatar_comparison import (
+    _decoded_video_timing, _timeline_error, create_source_avatar_comparison,
+)
 from src.tracking.holistic_tracker import MediaPipeHolisticBackend
 from src.tracking.pose_schema import PoseSequence
 from src.tracking.tracking_qc import evaluate_tracking
@@ -352,27 +355,33 @@ def main() -> int:
             khronos_validation,
             glb_validation_path,
         )
+        failure_evidence_paths = {
+            "source_video": video_path, "avatar": avatar_path, "pose": pose_path,
+            "motion": motion_path, "avatar_profile": profile_path, "bone_map": bone_map_path,
+            "neutral_hand_pose": neutral_hand_pose_path, "glb_validation": glb_validation_path,
+            "khronos_validation": khronos_validation_path,
+            "settings": resolve_project_path(args.config),
+            "qc_thresholds": resolve_project_path(args.qc_thresholds),
+            "video_preparation": preparation_path, "working_video": working_video_path,
+            "ik_report": ik_report_path,
+        }
         if glb_validation.get("status") == "FAIL":
+            failed_debug = {}
+            try:
+                failed_debug = render_review_debug(
+                    candidate_glb_path, video_path, working_video_path, video_info.fps,
+                    blender_path, run_dir / "review_debug", run_id,
+                )
+            except Exception as debug_exc:
+                # Keep the original technical failure and its export, even if
+                # an invalid candidate cannot be rendered for inspection.
+                atomic_write_json(run_dir / "review_debug_error.json", {"error": str(debug_exc)})
+                print(f"\nReview preview unavailable: {debug_exc}", flush=True)
             quarantine_failed_candidate(
                 candidate_glb_path,
                 output_dir_name,
                 run_id,
-                evidence_paths={
-                    "source_video": video_path,
-                    "avatar": avatar_path,
-                    "pose": pose_path,
-                    "motion": motion_path,
-                    "avatar_profile": profile_path,
-                    "bone_map": bone_map_path,
-                    "neutral_hand_pose": neutral_hand_pose_path,
-                    "glb_validation": glb_validation_path,
-                    "khronos_validation": khronos_validation_path,
-                    "settings": resolve_project_path(args.config),
-                    "qc_thresholds": resolve_project_path(args.qc_thresholds),
-                    "video_preparation": preparation_path,
-                    "working_video": working_video_path,
-                    "ik_report": ik_report_path,
-                },
+                evidence_paths={**failure_evidence_paths, **failed_debug},
             )
             raise RuntimeError(f"GLB validation failed: {glb_validation.get('reasons')}")
         # The side-by-side comparison is production review evidence, not an
@@ -405,6 +414,7 @@ def main() -> int:
         )
         comparison_generated = True
         source_avatar_validation["validation_run_id"] = run_id
+        source_avatar_validation["validated_glb_sha256"] = sha256_file(candidate_glb_path)
         source_avatar_validation["source_video_sha256"] = sha256_file(video_path)
         source_avatar_validation["working_video_sha256"] = sha256_file(working_video_path)
         source_avatar_validation["original_source_frame_count"] = prepared.source_info.frame_count
@@ -415,6 +425,17 @@ def main() -> int:
             else None
         )
         if qc_result.technical_qc == "FAIL" or source_avatar_validation.get("status") == "FAIL":
+            # Preserve this run's comparison report before rejecting publication.
+            # Never reuse the mutable report from a previous successful run.
+            failed_report = run_dir / "debug" / f"{gloss}.source_avatar_validation.json"
+            atomic_write_json(failed_report, source_avatar_validation)
+            quarantine_failed_candidate(
+                candidate_glb_path, output_dir_name, run_id,
+                evidence_paths={**failure_evidence_paths,
+                    "source_avatar_validation": failed_report,
+                    "comparison_video": candidate_source_avatar_preview_path,
+                    "avatar_preview": candidate_avatar_preview_path},
+            )
             raise RuntimeError("Required tracking or comparison validation failed; candidate was not published.")
         run_stage(
             16,
@@ -521,8 +542,51 @@ def main() -> int:
             conversion_completed_at=execution["completed_at"],
         )
         atomic_write_json(metadata_path, metadata)
+        delivery_debug = {"comparison_video": candidate_source_avatar_preview_path,
+                          "avatar_preview": candidate_avatar_preview_path,
+                          "source_avatar_validation": source_avatar_validation_path}
+        try:
+            validate_review_debug(delivery_debug, glb=candidate_glb_path, source_video=video_path,
+                                  run_id=run_id, working_video=working_video_path)
+        except Exception as debug_exc:
+            delivery_debug = {}
+            print(f"\nReview preview unavailable: {debug_exc}", flush=True)
+        try:
+            write_review_delivery(
+                project_root=PROJECT_ROOT, delivery_dir=PROJECT_ROOT / "output" / "review" / output_dir_name / run_id,
+                source_video=video_path, original_glb=candidate_glb_path, run_id=run_id,
+                batch_id=getattr(args, "batch_id", None) or run_id, technical_qc=final_technical_qc,
+                validation=glb_validation, metadata=metadata, execution=execution,
+                context_fingerprint=context_fingerprint,
+                debug_paths=delivery_debug,
+            )
+        except Exception as debug_exc:
+            print(f"\nReview delivery unavailable: {debug_exc}", flush=True)
     except Exception as exc:
-        recorder.finish("FAIL", error=f"{type(exc).__name__}: {exc}")
+        execution = recorder.finish("FAIL", error=f"{type(exc).__name__}: {exc}")
+        failed_glb = PROJECT_ROOT / "failed" / output_dir_name / run_id / f"{gloss}.glb"
+        if failed_glb.is_file():
+            try:
+                failed_evidence = load_failure_bundle(failed_glb)
+                delivery_debug = {role: failed_evidence[role] for role in
+                                  ("comparison_video", "avatar_preview", "source_avatar_validation")
+                                  if role in failed_evidence}
+                try:
+                    validate_review_debug(delivery_debug, glb=failed_glb, source_video=video_path,
+                                          run_id=run_id, working_video=failed_evidence.get("working_video"))
+                except Exception as debug_exc:
+                    delivery_debug = {}
+                    print(f"\nReview preview unavailable: {debug_exc}", flush=True)
+                write_review_delivery(
+                    project_root=PROJECT_ROOT, delivery_dir=PROJECT_ROOT / "output" / "review" / output_dir_name / run_id,
+                    source_video=video_path, original_glb=failed_glb, run_id=run_id,
+                    batch_id=getattr(args, "batch_id", None) or run_id, technical_qc="FAIL",
+                    validation=read_json(failed_evidence["glb_validation"], {}), evidence=failed_evidence,
+                    execution=execution, context_fingerprint=locals().get("context_fingerprint"),
+                    debug_paths=delivery_debug,
+                )
+            except Exception as debug_exc:
+                print(f"\nReview delivery unavailable: {debug_exc}", flush=True)
         release_output_lock(output_lock)
         print(f"\nFAIL: {exc}")
         return 1
@@ -598,8 +662,8 @@ def parse_args() -> argparse.Namespace:
         help="Stop dispatching and drain active jobs while this file exists; remove it and rerun to resume.",
     )
     parser.add_argument(
-        "--batch-failure-threshold", type=int, default=2,
-        help="Pause after this many failures in the same category (default: 2; 0 disables).",
+        "--batch-failure-threshold", type=int, default=0,
+        help="Pause after this many failures in the same category (default: 0, continue all inputs).",
     )
     parser.add_argument("--expected-context-fingerprint", help=argparse.SUPPRESS)
     parser.add_argument("--batch-id", help=argparse.SUPPRESS)
@@ -1029,6 +1093,166 @@ def run_batch(args: argparse.Namespace) -> int:
         release_output_lock(batch_lock)
 
 
+def render_review_debug(
+    glb: Path, source_video: Path, working_video: Path, fps: float,
+    blender_path: Path, debug_dir: Path, run_id: str,
+) -> dict[str, Path]:
+    """Use the existing renderer/comparison path for a hash-bound inspection video."""
+    if not math.isfinite(float(fps)) or fps <= 0:
+        raise ValueError("Review rendering requires a positive source FPS.")
+    stem = source_video.stem
+    paths = {"avatar_preview": debug_dir / f"{stem}_avatar_preview.mp4",
+             "comparison_video": debug_dir / f"{stem}_source_avatar_comparison.mp4",
+             "source_avatar_validation": debug_dir / f"{stem}.source_avatar_validation.json"}
+
+    def generate():
+        print(f"Rendering source/avatar review: {source_video.name}", flush=True)
+        run_blender_render_animation(blender_path, glb, fps, paths["avatar_preview"])
+        report = create_source_avatar_comparison(working_video, paths["avatar_preview"], paths["comparison_video"])
+        report.update(validation_run_id=run_id, source_video_sha256=sha256_file(source_video),
+                      working_video_sha256=sha256_file(working_video), validated_glb_sha256=sha256_file(glb),
+                      comparison_video_sha256=sha256_file(paths["comparison_video"]), inspection_only=True)
+        atomic_write_json(paths["source_avatar_validation"], report)
+        validate_review_debug(paths, glb=glb, source_video=source_video, run_id=run_id,
+                              working_video=working_video)
+
+    StageCache(PROJECT_ROOT / "temp" / "stage_cache" / "review_debug" / run_id).execute(
+        "comparison", inputs={"glb": glb, "source_video": source_video, "working_video": working_video,
+                              "blender": blender_path,
+                              "renderer": PROJECT_ROOT / "src/blender/blender_render_animation.py",
+                              "utils": PROJECT_ROOT / "src/blender/blender_utils.py",
+                              "comparison": PROJECT_ROOT / "src/qc/source_avatar_comparison.py"},
+        settings={"fps": fps, "run_id": run_id, "original_filename": source_video.name,
+                  "review_evidence_schema": 1},
+        outputs=paths, action=generate,
+    )
+    # Cached bytes are hash checked by StageCache; still verify their decoded
+    # contents and binding before advertising an inspection video.
+    validate_review_debug(paths, glb=glb, source_video=source_video, run_id=run_id,
+                          working_video=working_video)
+    return paths
+
+
+def validate_review_debug(
+    paths: dict[str, Path], *, glb: Path, source_video: Path, run_id: str,
+    working_video: Path | None = None,
+) -> None:
+    """Require complete, decodable comparison evidence for this conversion."""
+    if "comparison_video" not in paths or "source_avatar_validation" not in paths:
+        raise RuntimeError("Review comparison and its validation report are both required.")
+    report = read_json(paths["source_avatar_validation"], {})
+    expected = report.get("expected_comparison_frame_count")
+    if (report.get("status") not in {"PASS", "REVIEW"}
+            or report.get("comparison_complete") is not True
+            or isinstance(expected, bool) or not isinstance(expected, int) or expected <= 0
+            or any(report.get(name) != expected for name in (
+                "source_frame_count", "avatar_frame_count", "comparison_frame_count",
+                "comparison_reopened_frame_count"))):
+        raise RuntimeError("Review comparison is empty or incomplete; see its validation report.")
+    bindings = {"validation_run_id": run_id, "source_video_sha256": sha256_file(source_video),
+                "comparison_video_sha256": sha256_file(paths["comparison_video"])}
+    # Historical release evidence already binds its report to the run GLB.
+    # New reports additionally carry the GLB hash explicitly.
+    if "validated_glb_sha256" in report:
+        bindings["validated_glb_sha256"] = sha256_file(glb)
+    if working_video is not None:
+        bindings["working_video_sha256"] = sha256_file(working_video)
+    if any(not value or report.get(key) != value for key, value in bindings.items()):
+        raise RuntimeError("Review comparison source, GLB, run or video hash binding differs.")
+    count, fps, timestamps = _decoded_video_timing(paths["comparison_video"])
+    expected_fps = report.get("source_fps")
+    if (isinstance(expected_fps, bool) or not isinstance(expected_fps, (int, float))
+            or not math.isfinite(expected_fps) or expected_fps <= 0
+            or not math.isfinite(fps) or fps <= 0 or abs(fps - expected_fps) > 0.001
+            or count != expected):
+        raise RuntimeError("Review comparison decoded frame count or FPS differs from its report.")
+    timing_error = _timeline_error(timestamps, fps)
+    if timing_error is None or timing_error > 0.0011:
+        raise RuntimeError("Review comparison decoded timeline is incomplete or inconsistent.")
+
+
+def review_debug_paths(
+    *, original: Path, source_video: Path, run_root: Path, run_id: str,
+    metadata: dict | None, evidence: dict[str, Path] | None,
+) -> dict[str, Path]:
+    """Reuse immutable comparisons; backfill older failed runs without reconversion."""
+    paths = {}
+    if metadata is not None:
+        records = metadata.get("release_evidence", {})
+        for role in ("comparison_video", "source_avatar_validation"):
+            if role in records:
+                paths[role] = _verified_bundle_record(records[role], run_root.resolve(), f"review {role}")
+    elif evidence:
+        paths = {role: evidence[role] for role in
+                 ("comparison_video", "avatar_preview", "source_avatar_validation") if role in evidence}
+    if "comparison_video" in paths:
+        validate_review_debug(paths, glb=original, source_video=source_video, run_id=run_id,
+                              working_video=(evidence or {}).get("working_video"))
+        return paths
+    if not evidence or "video_preparation" not in evidence or "working_video" not in evidence:
+        raise RuntimeError("No bound comparison or prepared working video for review rendering.")
+    preparation = read_json(evidence["video_preparation"], {})
+    config = load_yaml(PROJECT_ROOT / "config/settings.yaml")
+    blender = resolve_project_path(config.get("blender", {}).get("executable") or default_blender_path())
+    return render_review_debug(original, source_video, evidence["working_video"],
+                               float(preparation.get("working", {}).get("fps", 0)),
+                               blender, run_root / "review_debug", run_id)
+
+
+def attach_batch_review(
+    item: dict[str, Any], plan: dict[str, Any], summary: dict[str, Any],
+    verified: dict[str, Any] | None = None,
+) -> None:
+    """Expose verified candidates for inspection without changing technical QC."""
+    item.update(technical_qc=item["status"], review_available=False, review_status="UNAVAILABLE",
+                debug_available=False)
+    item.pop("review_delivery", None)
+    item.pop("review_error", None)
+    item.pop("debug_error", None)
+    try:
+        preserved = verified or verify_completed_batch_item(item, summary, plan)
+        output = PROJECT_ROOT / "output" / plan["output_dir_name"]
+        run_id = preserved["run_id"]
+        run_root = output / "runs" / run_id
+        original = PROJECT_ROOT / preserved["preserved_artifact"]["path"]
+        execution = read_json(run_root / "execution.json", {})
+        metadata = None
+        evidence = None
+        if item["status"] == "FAIL":
+            evidence = load_failure_bundle(original)
+            validation_path = evidence["glb_validation"]
+        else:
+            metadata = read_json(output / f"{plan['video'].stem}.metadata.json", {})
+            validation_path = _verified_bundle_record(
+                metadata.get("release_evidence", {}).get("glb_validation"),
+                run_root.resolve(), "review GLB validation",
+            )
+        try:
+            debug_paths = review_debug_paths(original=original, source_video=plan["video"],
+                                            run_root=run_root, run_id=run_id, metadata=metadata, evidence=evidence)
+            item.pop("debug_error", None)
+        except Exception as debug_exc:
+            debug_paths = {}
+            item["debug_error"] = f"{type(debug_exc).__name__}: {debug_exc}"
+        delivery = write_review_delivery(
+            project_root=PROJECT_ROOT,
+            delivery_dir=PROJECT_ROOT / "output" / "review" / plan["output_dir_name"] / run_id,
+            source_video=plan["video"], original_glb=original, run_id=run_id,
+            batch_id=summary["batch_id"], technical_qc=item["status"],
+            validation=read_json(validation_path, {}), metadata=metadata,
+            evidence=evidence, execution=execution,
+            context_fingerprint=preserved.get("original_context_fingerprint"),
+            debug_paths=debug_paths,
+        )
+        item.update(preserved)
+        item.update(review_available=True, review_status=delivery["review_status"], review_delivery=delivery)
+        item["debug_available"] = delivery.get("review_debug", {}).get("comparison_available") is True
+    except Exception as exc:
+        # A broken/missing export or evidence is not a reviewable success.
+        # Preserve the exact blocker and keep converting unrelated inputs.
+        item["review_error"] = f"{type(exc).__name__}: {exc}"
+
+
 def _run_batch_locked(args: argparse.Namespace, batch_id: str) -> int:
 
     if not args.input_dir:
@@ -1046,7 +1270,7 @@ def _run_batch_locked(args: argparse.Namespace, batch_id: str) -> int:
     workers = getattr(args, "batch_workers", 1)
     timeout_seconds = getattr(args, "batch_timeout_seconds", 3600.0)
     retries = getattr(args, "batch_retries", 1)
-    failure_threshold = getattr(args, "batch_failure_threshold", 2)
+    failure_threshold = getattr(args, "batch_failure_threshold", 0)
     if isinstance(failure_threshold, bool) or not isinstance(failure_threshold, int) or failure_threshold < 0:
         raise SystemExit("--batch-failure-threshold must be a nonnegative integer.")
     pause_file = resolve_project_path(getattr(args, "batch_pause_file", "./output/.batch_pause"))
@@ -1185,6 +1409,7 @@ def _run_batch_locked(args: argparse.Namespace, batch_id: str) -> int:
         "retried": 0,
         "batch_status": "RUNNING",
         "items": [],
+        "review_directory": relative_display(PROJECT_ROOT / "output" / "review"),
     }
     item_by_key: dict[str, dict[str, Any]] = {}
     if checkpoint:
@@ -1221,9 +1446,35 @@ def _run_batch_locked(args: argparse.Namespace, batch_id: str) -> int:
             item.update(deepcopy(original))
             item.update(preserved)
             item.update(video=str(video), relative_video=relative_video, disposition="SKIPPED_INTACT")
+            attach_batch_review(item, plan, summary, preserved)
+            if item["review_available"]:
+                source_records[plan["source_id"]].update(
+                    review_resume_fingerprint=plan["resume_fingerprint"], review_batch_id=batch_id,
+                )
+            print(f"Preserved {relative_video}: technical={item['status']}, review={item['review_status']}", flush=True)
             continue
 
         previous = source_records.get(plan["source_id"])
+        if (
+            checkpoint is None and bool(getattr(args, "batch_resume", True))
+            and isinstance(previous, dict)
+            and previous.get("review_resume_fingerprint") == plan["resume_fingerprint"]
+            and previous.get("review_batch_id")
+        ):
+            review_checkpoint = load_batch_checkpoint(previous["review_batch_id"])
+            prior_item = next((entry for entry in review_checkpoint["items"]
+                               if entry["source_id"] == plan["source_id"]), None)
+            if prior_item is None:
+                raise RuntimeError(f"Missing completed review checkpoint for {relative_video}.")
+            preserved = verify_completed_batch_item(prior_item, review_checkpoint, plan)
+            item.update(deepcopy(prior_item))
+            item.update(preserved)
+            item.update(video=str(video), relative_video=relative_video, disposition="SKIPPED_INTACT")
+            attach_batch_review(item, plan, summary, preserved)
+            if item["review_available"]:
+                previous.update(review_batch_id=batch_id)
+            print(f"Preserved {relative_video}: technical={item['status']}, review={item['review_status']}", flush=True)
+            continue
         can_resume = (
             bool(getattr(args, "batch_resume", True))
             and isinstance(previous, dict)
@@ -1242,10 +1493,23 @@ def _run_batch_locked(args: argparse.Namespace, batch_id: str) -> int:
             if resumed["production_eligible"] or resumed["engineering_candidate"]:
                 item.update(resumed)
                 item["disposition"] = "SKIPPED_INTACT"
+                try:
+                    prior_checkpoint = load_batch_checkpoint(previous.get("last_batch_id"))
+                    prior_item = next(entry for entry in prior_checkpoint["items"]
+                                      if entry["source_id"] == plan["source_id"])
+                    preserved = verify_completed_batch_item(prior_item, prior_checkpoint, plan)
+                    item.update(completed_at=prior_item["completed_at"], **preserved)
+                    attach_batch_review(item, plan, summary, preserved)
+                    if item["review_available"]:
+                        previous.update(review_resume_fingerprint=plan["resume_fingerprint"], review_batch_id=batch_id)
+                except (Exception, SystemExit) as exc:
+                    item.update(technical_qc=item["status"], review_available=False,
+                                review_status="UNAVAILABLE", review_error=str(exc))
                 continue
 
         cmd = [
             sys.executable,
+            "-u",
             str(PROJECT_ROOT / "convert.py"),
             "--video",
             str(video),
@@ -1330,7 +1594,12 @@ def _run_batch_locked(args: argparse.Namespace, batch_id: str) -> int:
         record.update(last_batch_id=batch_id, last_status=item["status"])
         if item["engineering_candidate"] or item["production_eligible"]:
             record["resume_fingerprint"] = plan["resume_fingerprint"]
+        attach_batch_review(item, plan, summary)
+        if item["review_available"] and not context_changed:
+            record.update(review_resume_fingerprint=plan["resume_fingerprint"], review_batch_id=batch_id)
         persist()
+        print(f"[{summary['processed'] + summary['skipped']}/{summary['total']}] "
+              f"{result.key}: technical={item['status']}, review={item['review_status']}", flush=True)
 
     def should_pause() -> str | None:
         if not context_is_current():
@@ -1355,6 +1624,7 @@ def _run_batch_locked(args: argparse.Namespace, batch_id: str) -> int:
         item_by_key[job.key]["disposition"] = "RUNNING"
         item_by_key[job.key]["started_at"] = utc_now_iso()
         persist()
+        print(f"Starting {job.key} ({summary['running']} worker(s) active)", flush=True)
 
     persist()
     try:
@@ -1401,6 +1671,10 @@ def _run_batch_locked(args: argparse.Namespace, batch_id: str) -> int:
                     "pending",
                     "pause_reason",
                     "failure_groups",
+                    "review_available",
+                    "review_unavailable",
+                    "review_batch_status",
+                    "review_directory",
                 ]
             },
             indent=2,
@@ -1408,7 +1682,7 @@ def _run_batch_locked(args: argparse.Namespace, batch_id: str) -> int:
     )
     if summary["batch_status"] == "PAUSED":
         return 3
-    if summary["fail"]:
+    if summary["fail"] or summary["review_unavailable"]:
         return 1
     if getattr(args, "require_production", False) and summary["production_ready"] != summary["total"]:
         return 2
@@ -1642,6 +1916,15 @@ def refresh_batch_summary(summary: dict[str, Any], *, final: bool = False) -> No
         for item in items
     )
     summary["failure_groups"] = group_failures(items)
+    summary["review_available"] = sum(item.get("review_available") is True for item in items)
+    summary["review_unavailable"] = sum(
+        item.get("disposition") in {"PROCESSED", "SKIPPED_INTACT"}
+        and item.get("review_available") is not True for item in items
+    )
+    summary["review_batch_status"] = (
+        "READY_FOR_REVIEW" if summary["review_available"] == summary["total"]
+        else ("IN_PROGRESS" if summary["pending"] or summary["running"] else "INCOMPLETE")
+    )
     if summary.get("pause_reason"):
         summary["batch_status"] = "DRAINING" if summary["running"] and not final else "PAUSED"
     elif not final and (summary["pending"] or summary["running"]):
@@ -2940,6 +3223,8 @@ def run_blender_render_animation(blender_path: Path, glb_path: Path, fps: float,
         str(blender_path),
         "--factory-startup",
         "--background",
+        "--python-exit-code",
+        "17",
         "--python",
         str(PROJECT_ROOT / "src" / "blender" / "blender_render_animation.py"),
         "--",

@@ -55,6 +55,10 @@ def test_neutral_fingers_cannot_be_overridden_by_tracking(tmp_path, observed_edg
             assert np.all(weights == 0.0)
         else:
             assert np.any(weights >= 0.999)
+            # Keep the existing six-frame release/contact timing. Blender's
+            # anchored return must reach this declared endpoint exactly.
+            np.testing.assert_allclose(weights[22:28, 0], np.arange(1, 7) / 6.0, atol=1e-7)
+            assert np.all(weights[27:] == 1.0)
         assert np.all(influence[weights >= 0.999] == 0.0)
         assert np.any(influence[weights == 0.0] > 0.0)
         raw_observed = np.isfinite(hands).all(axis=(1, 2))
@@ -123,6 +127,68 @@ for side,details in constraints.items():
             actual=hand.inverted() @ armature.pose.bones[segment['bone_name']].matrix.to_quaternion()
             angle=2*np.arccos(np.clip(abs(previous[segment['bone_name']].dot(actual)),0,1))
             assert np.degrees(angle) <= 20.01, (segment['bone_name'],np.degrees(angle))
+# A six-frame planned 170deg return needs 28.33deg per frame. It is a
+# continuous anchored SLERP, not an unobserved tracking reversal to rate-limit.
+for details in constraints.values():
+    hand=armature.pose.bones[details['hand_name']].matrix.to_quaternion()
+    for segments in details['fingers'].values():
+        for segment in segments:
+            neutral_rotation=segment['previous_final_rotation'].copy()
+            start=(Quaternion((1,0,0),np.radians(170.)) @ neutral_rotation).normalized()
+            segment['neutral_palm_rotation']=neutral_rotation
+            segment['previous_final_rotation']=start
+            segment['previous_palm_rotation']=start.copy()
+            segment['previous_neutral_weight']=0.
+            segment.pop('neutral_exit_anchor',None)
+            bone=armature.pose.bones[segment['bone_name']]
+            matrix=(hand @ start).to_matrix().to_4x4(); matrix.translation=bone.head.copy()
+            bone.matrix=matrix
+            bpy.context.view_layer.update()
+for step in range(1,7):
+    previous={segment['bone_name']:segment['previous_final_rotation'].copy() for details in constraints.values() for segments in details['fingers'].values() for segment in segments}
+    update_finger_targets(armature,objects,constraints,directions,np.zeros((2,5,3),dtype=bool),np.zeros((2,5,3)),step+2,np.full(2,step/6.))
+    for details in constraints.values():
+        hand=armature.pose.bones[details['hand_name']].matrix.to_quaternion()
+        for segments in details['fingers'].values():
+            for segment in segments:
+                actual=(hand.inverted() @ armature.pose.bones[segment['bone_name']].matrix.to_quaternion()).normalized()
+                angle=2*np.arccos(np.clip(abs(previous[segment['bone_name']].dot(actual)),0,1))
+                assert abs(np.degrees(angle)-170./6.) < .05, (step,segment['bone_name'],np.degrees(angle))
+                if step==6:
+                    error=2*np.arccos(np.clip(abs(actual.dot(segment['neutral_palm_rotation'])),0,1))
+                    assert np.degrees(error)<.1, (segment['bone_name'],np.degrees(error))
+assert sum(len(details['planned_neutral_transitions']) for details in constraints.values())==180
+# A sudden unobserved neutral reversal is not a planned return and must still
+# obey the same 20deg test cap; neither an anchor alone nor weight=1 exempts it.
+for details in constraints.values():
+    for segments in details['fingers'].values():
+        for segment in segments:
+            segment['neutral_palm_rotation']=(Quaternion((1,0,0),np.radians(170.)) @ segment['previous_final_rotation']).normalized()
+            segment['previous_neutral_weight']=0.
+            segment.pop('neutral_exit_anchor',None)
+previous={segment['bone_name']:segment['previous_final_rotation'].copy() for details in constraints.values() for segments in details['fingers'].values() for segment in segments}
+update_finger_targets(armature,objects,constraints,directions,np.zeros((2,5,3),dtype=bool),np.zeros((2,5,3)),9,np.ones(2))
+for details in constraints.values():
+    hand=armature.pose.bones[details['hand_name']].matrix.to_quaternion()
+    for segments in details['fingers'].values():
+        for segment in segments:
+            actual=(hand.inverted() @ armature.pose.bones[segment['bone_name']].matrix.to_quaternion()).normalized()
+            angle=2*np.arccos(np.clip(abs(previous[segment['bone_name']].dot(actual)),0,1))
+            assert np.degrees(angle)<=20.01, (segment['bone_name'],np.degrees(angle))
+assert sum(len(details['planned_neutral_transitions']) for details in constraints.values())==180
+# A stale plan flag cannot exempt a pose which has already fallen off its arc.
+for details in constraints.values():
+    for segments in details['fingers'].values():
+        for segment in segments:
+            segment['previous_neutral_weight']=.5
+previous={segment['bone_name']:segment['previous_final_rotation'].copy() for details in constraints.values() for segments in details['fingers'].values() for segment in segments}
+update_finger_targets(armature,objects,constraints,directions,np.zeros((2,5,3),dtype=bool),np.zeros((2,5,3)),10,np.full(2,2./3.))
+for details in constraints.values():
+    for segments in details['fingers'].values():
+        for segment in segments:
+            angle=2*np.arccos(np.clip(abs(previous[segment['bone_name']].dot(segment['previous_final_rotation'])),0,1))
+            assert np.degrees(angle)<=20.01, (segment['bone_name'],np.degrees(angle))
+assert sum(len(details['planned_neutral_transitions']) for details in constraints.values())==180
 for frame in range(1,6):
     bpy.context.scene.frame_set(frame)
     for side in ['Left','Right']:

@@ -91,6 +91,13 @@ def test_batch_persistent_records_resume_between_input_folders(tmp_path, monkeyp
     monkeypatch.setattr(convert, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(convert, "evaluate_published_release", lambda *a, **k: (False, ["pending review"]))
     monkeypatch.setattr(convert, "evaluate_published_engineering_candidate", lambda *a, **k: True)
+    # This test isolates index/folder resume; artifact verification has separate tests.
+    monkeypatch.setattr(convert, "attach_batch_review", lambda item, *a, **k:
+                        item.update(review_available=True, review_status="PENDING"))
+    monkeypatch.setattr(convert, "verify_completed_batch_item", lambda item, checkpoint, plan: {
+        "original_batch_id": checkpoint["batch_id"], "run_id": "a" * 32,
+        "preserved_artifact": {"path": "fixture.glb", "sha256": "b" * 64},
+    })
     dispatch_counts = []
 
     def fake_runner(jobs, **kwargs):
@@ -278,6 +285,232 @@ def test_explicit_batch_continuation_refuses_changed_completed_originals(interru
 def test_explicit_batch_continuation_rejects_unsafe_id(batch_id):
     with pytest.raises(SystemExit, match="hexadecimal batch ID"):
         convert.load_batch_checkpoint(batch_id)
+
+
+def test_review_summary_keeps_failures_separate_from_review_availability():
+    summary = {"total": 2, "items": [
+        {"status": "FAIL", "disposition": "PROCESSED", "review_available": True},
+        {"status": "REVIEW", "disposition": "SKIPPED_INTACT", "review_available": True},
+    ]}
+    convert.refresh_batch_summary(summary, final=True)
+    assert summary["fail"] == 1 and summary["review"] == 1
+    assert summary["batch_status"] == "FAIL"
+    assert summary["review_batch_status"] == "READY_FOR_REVIEW"
+    assert summary["review_available"] == 2 and summary["production_ready"] == 0
+    summary["items"][0]["review_available"] = False
+    convert.refresh_batch_summary(summary, final=True)
+    assert summary["review_batch_status"] == "INCOMPLETE"
+    assert summary["review_unavailable"] == 1
+
+
+def test_missing_candidate_is_not_advertised_for_review(tmp_path, monkeypatch):
+    monkeypatch.setattr(convert, "PROJECT_ROOT", tmp_path)
+    item = {"status": "FAIL", "review_delivery": {"glb_path": "stale.glb"},
+            "debug_available": True, "debug_error": "stale preview error"}
+    convert.attach_batch_review(item, {"video": tmp_path / "bad.mp4", "output_dir_name": "BAD"}, {"batch_id": "a" * 32})
+    assert item["technical_qc"] == "FAIL"
+    assert item["review_available"] is False and item["review_status"] == "UNAVAILABLE"
+    assert item["review_error"]
+    assert "review_delivery" not in item
+    assert item["debug_available"] is False
+    assert "debug_error" not in item
+
+
+@pytest.fixture
+def review_preview(tmp_path, monkeypatch):
+    """Real tiny MP4s exercise comparison decoding; Blender itself is mocked."""
+    monkeypatch.setattr(convert, "PROJECT_ROOT", tmp_path)
+    source = tmp_path / "Clip.mp4"
+    writer = cv2.VideoWriter(str(source), cv2.VideoWriter_fourcc(*"mp4v"), 25, (64, 48))
+    assert writer.isOpened()
+    for index in range(4):
+        writer.write(np.full((48, 64, 3), 30 + index * 30, np.uint8))
+    writer.release()
+    run_id = "a" * 32
+    run_root = tmp_path / "output" / "CLIP" / "runs" / run_id
+    run_root.mkdir(parents=True)
+    glb = run_root / "Clip.glb"
+    glb.write_bytes(b"conversion artifact; renderer is mocked")
+    blender = tmp_path / "blender.exe"
+    blender.write_bytes(b"mock executable")
+    for name in ("src/blender/blender_render_animation.py", "src/blender/blender_utils.py",
+                 "src/qc/source_avatar_comparison.py"):
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# fixture dependency", encoding="utf-8")
+    rendered = []
+
+    def render(executable, candidate, fps, output):
+        rendered.append((candidate, fps))
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(source.read_bytes())
+
+    monkeypatch.setattr(convert, "run_blender_render_animation", render)
+    monkeypatch.setattr(convert, "load_yaml", lambda path: {"blender": {"executable": str(blender)}})
+    return SimpleNamespace(source=source, glb=glb, blender=blender, run_id=run_id,
+                           run_root=run_root, rendered=rendered)
+
+
+def _render_review_fixture(fixture):
+    return convert.render_review_debug(fixture.glb, fixture.source, fixture.source, 25,
+                                       fixture.blender, fixture.run_root / "review_debug", fixture.run_id)
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_review_debug_reuses_verified_normal_and_failed_comparison(review_preview, failed):
+    fixture = review_preview
+    paths = _render_review_fixture(fixture)
+    metadata = None if failed else {"release_evidence": {
+        role: convert.release_evidence_record(path) for role, path in paths.items()
+        if role != "avatar_preview"}}
+    evidence = {**paths, "working_video": fixture.source} if failed else None
+    reused = convert.review_debug_paths(original=fixture.glb, source_video=fixture.source,
+        run_root=fixture.run_root, run_id=fixture.run_id, metadata=metadata, evidence=evidence)
+    assert reused["comparison_video"] == paths["comparison_video"]
+    assert len(fixture.rendered) == 1
+
+
+def test_review_debug_backfills_failed_export_and_reuses_exact_render_cache(review_preview):
+    fixture = review_preview
+    preparation = fixture.run_root / "video_preparation.json"
+    preparation.write_text(json.dumps({"working": {"fps": 25}}), encoding="utf-8")
+    args = dict(original=fixture.glb, source_video=fixture.source, run_root=fixture.run_root,
+        run_id=fixture.run_id, metadata=None,
+        evidence={"video_preparation": preparation, "working_video": fixture.source})
+    first = convert.review_debug_paths(**args)
+    before = {role: path.read_bytes() for role, path in first.items()}
+    assert convert.review_debug_paths(**args) == first
+    assert len(fixture.rendered) == 1
+    assert {role: path.read_bytes() for role, path in first.items()} == before
+    fixture.glb.write_bytes(b"different export")
+    convert.review_debug_paths(**args)
+    assert len(fixture.rendered) == 2
+    report = json.loads(first["source_avatar_validation"].read_text())
+    assert report["validated_glb_sha256"] == convert.sha256_file(fixture.glb)
+
+
+@pytest.mark.parametrize("field", ["validation_run_id", "source_video_sha256",
+                                  "validated_glb_sha256", "comparison_video_sha256"])
+def test_review_comparison_refuses_wrong_run_or_artifact_binding(review_preview, field):
+    fixture = review_preview
+    paths = _render_review_fixture(fixture)
+    report = json.loads(paths["source_avatar_validation"].read_text())
+    report[field] = "wrong"
+    paths["source_avatar_validation"].write_text(json.dumps(report), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="binding differs"):
+        convert.validate_review_debug(paths, glb=fixture.glb, source_video=fixture.source,
+                                      run_id=fixture.run_id)
+
+
+def test_review_comparison_accepts_legacy_report_bound_by_release_evidence(review_preview):
+    fixture = review_preview
+    paths = _render_review_fixture(fixture)
+    report = json.loads(paths["source_avatar_validation"].read_text())
+    del report["validated_glb_sha256"]
+    paths["source_avatar_validation"].write_text(json.dumps(report), encoding="utf-8")
+    convert.validate_review_debug(paths, glb=fixture.glb, source_video=fixture.source,
+                                  run_id=fixture.run_id)
+
+
+@pytest.mark.parametrize("failure", ["render", "empty", "incomplete"])
+def test_failed_review_preview_never_commits_cache_manifest(review_preview, monkeypatch, failure):
+    fixture = review_preview
+    if failure == "render":
+        monkeypatch.setattr(convert, "run_blender_render_animation",
+            lambda *args: (_ for _ in ()).throw(RuntimeError("render failed")))
+    else:
+        def bad_comparison(source, avatar, output):
+            output.write_bytes(b"undecodable preview")
+            return {"status": "FAIL" if failure == "empty" else "REVIEW",
+                    "comparison_complete": False, "expected_comparison_frame_count": 4,
+                    "comparison_frame_count": 0 if failure == "empty" else 2}
+        monkeypatch.setattr(convert, "create_source_avatar_comparison", bad_comparison)
+    with pytest.raises(RuntimeError, match="render failed|empty or incomplete"):
+        _render_review_fixture(fixture)
+    assert not list((convert.PROJECT_ROOT / "temp" / "stage_cache").rglob("manifest.json"))
+
+
+def test_review_comparison_reopens_video_instead_of_trusting_report(review_preview):
+    fixture = review_preview
+    paths = _render_review_fixture(fixture)
+    paths["comparison_video"].write_bytes(b"not decodable")
+    report = json.loads(paths["source_avatar_validation"].read_text())
+    report["comparison_video_sha256"] = convert.sha256_file(paths["comparison_video"])
+    paths["source_avatar_validation"].write_text(json.dumps(report), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="decoded frame count or FPS"):
+        convert.validate_review_debug(paths, glb=fixture.glb, source_video=fixture.source,
+                                      run_id=fixture.run_id)
+
+
+def test_batch_review_keeps_failed_glb_available_when_preview_fails(review_preview, monkeypatch):
+    fixture = review_preview
+    validation = fixture.run_root / "validation.json"
+    validation.write_text(json.dumps({"status": "FAIL"}), encoding="utf-8")
+    monkeypatch.setattr(convert, "load_failure_bundle", lambda path: {"glb_validation": validation})
+    monkeypatch.setattr(convert, "review_debug_paths",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("preview cannot decode")))
+    deliveries = []
+
+    def delivery(**kwargs):
+        deliveries.append(kwargs)
+        return {"review_status": "PENDING", "review_debug": {"comparison_available": False}}
+
+    monkeypatch.setattr(convert, "write_review_delivery", delivery)
+    item = {"status": "FAIL", "debug_available": True}
+    verified = {"run_id": fixture.run_id,
+                "preserved_artifact": {"path": str(fixture.glb), "sha256": convert.sha256_file(fixture.glb)}}
+    convert.attach_batch_review(item, {"video": fixture.source, "output_dir_name": "CLIP"},
+                                {"batch_id": "b" * 32}, verified)
+    assert item["technical_qc"] == "FAIL" and item["review_available"] is True
+    assert item["debug_available"] is False and "preview cannot decode" in item["debug_error"]
+    assert deliveries[0]["debug_paths"] == {}
+    assert deliveries[0]["technical_qc"] == "FAIL"
+
+
+def test_preview_renderer_propagates_blender_python_errors(tmp_path, monkeypatch):
+    blender = tmp_path / "blender.exe"
+    blender.write_bytes(b"executable")
+    output = tmp_path / "preview.mp4"
+    commands = []
+
+    def run(command, **kwargs):
+        commands.append(command)
+        output.write_bytes(b"preview")
+
+    monkeypatch.setattr(convert.subprocess, "run", run)
+    convert.run_blender_render_animation(blender, tmp_path / "candidate.glb", 25, output)
+    index = commands[0].index("--python-exit-code")
+    assert commands[0][index + 1] == "17"
+
+
+def test_review_resume_skips_unchanged_failed_and_reviewed_exports(interrupted_batch, monkeypatch):
+    args, original, artifacts = interrupted_batch
+    dispatches = []
+
+    def fake_review(item, plan, summary, verified=None):
+        item.update(technical_qc=item["status"], review_status="PENDING", review_available=True)
+
+    monkeypatch.setattr(convert, "attach_batch_review", fake_review)
+    monkeypatch.setattr(convert, "run_isolated_jobs", lambda jobs, **kwargs: dispatches.append([job.key for job in jobs]))
+    assert convert.run_batch(args) == 1
+    args.resume_batch = None
+    assert convert.run_batch(args) == 1
+    assert dispatches == [["Arrive.mp4", "Destination.mp4"]] * 2
+    summary = json.loads((convert.PROJECT_ROOT / "output" / "batch_summary.json").read_text())
+    assert summary["skipped"] == 2 and summary["review_available"] == 2
+    assert summary["fail"] == 1 and summary["review"] == 1
+    # Content tampering must not silently trigger conversion or appear intact.
+    artifacts["Coach"].write_bytes(b"tampered")
+    with pytest.raises(RuntimeError):
+        convert.run_batch(args)
+    assert len(dispatches) == 2
+
+
+def test_batch_default_continues_after_quality_failures(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["convert.py", "--batch", "--input-dir", "input"])
+    args = convert.parse_args()
+    assert args.batch_failure_threshold == 0
+    assert args.batch_workers == 1
 
 
 def test_ffprobe_launch_failure_falls_back(monkeypatch, tmp_path):

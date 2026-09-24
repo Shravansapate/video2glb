@@ -93,14 +93,10 @@ def solve_motion_from_pose(
     right_hand_observed = mediapipe_image_to_canonical(right_hand, aspect_ratio=aspect_ratio)
     left_points = interpolate_short_gaps(left_hand_observed, max_gap=max(2, int(round(fps * 0.20))))
     right_points = interpolate_short_gaps(right_hand_observed, max_gap=max(2, int(round(fps * 0.20))))
-    left_hand_shape = interpolate_short_gaps(mediapipe_world_to_canonical(left_hand_world), max_gap=max(2, int(round(fps * 0.20))))
-    right_hand_shape = interpolate_short_gaps(mediapipe_world_to_canonical(right_hand_world), max_gap=max(2, int(round(fps * 0.20))))
     if smoothing:
         pose_points = smooth_landmarks_centered(pose_points, radius=max(1, int(round(fps * 0.08))))
         left_points = smooth_landmarks_centered(left_points, radius=max(1, int(round(fps * 0.04))))
         right_points = smooth_landmarks_centered(right_points, radius=max(1, int(round(fps * 0.04))))
-        left_hand_shape = smooth_landmarks_centered(left_hand_shape, radius=max(1, int(round(fps * 0.04))))
-        right_hand_shape = smooth_landmarks_centered(right_hand_shape, radius=max(1, int(round(fps * 0.04))))
     left_finger_curls = _compute_finger_curls(left_points)
     right_finger_curls = _compute_finger_curls(right_points)
     if smoothing:
@@ -112,18 +108,17 @@ def solve_motion_from_pose(
     right_finger_curls = _hold_last_finger_curls(right_finger_curls)
     left_finger_curls = _limit_finger_curl_steps(left_finger_curls, max_delta=np.radians(35.0))
     right_finger_curls = _limit_finger_curl_steps(right_finger_curls, max_delta=np.radians(35.0))
-    left_finger_directions, left_finger_direction_valid = _build_finger_directions(left_hand_shape)
-    right_finger_directions, right_finger_direction_valid = _build_finger_directions(right_hand_shape)
-    # Hand landmark directions are noisier than palm translation. Limit the
-    # per-frame turn in local palm space before Blender turns them into bone
-    # rotations, otherwise a single landmark outlier can spin a finger.
-    finger_directions = np.stack([left_finger_directions, right_finger_directions], axis=1)
-    finger_direction_usable = np.stack([left_finger_direction_valid, right_finger_direction_valid], axis=1)
-    # Filled gaps can drive a constraint, but are not observed source evidence.
-    finger_direction_valid = np.stack([
-        _build_finger_directions(mediapipe_world_to_canonical(hand))[1]
-        for hand in (left_hand_world, right_hand_world)
-    ], axis=1)
+    # Derive hand shape before any temporal mixing: averaging hand-world XYZ
+    # from differently rotated palms shears the fingers and their local basis.
+    raw_fingers = [_build_finger_directions(mediapipe_world_to_canonical(hand))
+                   for hand in (left_hand_world, right_hand_world)]
+    finger_direction_valid = np.stack([item[1] for item in raw_fingers], axis=1)
+    finger_directions, finger_direction_usable, finger_conditioning = _condition_finger_directions(
+        np.stack([item[0] for item in raw_fingers], axis=1),
+        finger_direction_valid,
+        max_gap=max(2, int(round(fps * 0.20))),
+        smoothing_radius=max(1, int(round(fps * 0.04))) if smoothing else 0,
+    )
     finger_directions = _limit_finger_direction_steps(finger_directions, finger_direction_usable, max_delta=np.radians(24.0))
     finger_directions, finger_direction_constraint_valid = _hold_finger_directions_for_release(
         finger_directions,
@@ -225,8 +220,15 @@ def solve_motion_from_pose(
         world_points, visibility, segment_lengths, fps, smoothing=smoothing,
     )
     ik_diagnostics = {"source_depth": depth_report}
-    ik_targets = _build_ik_targets(_canonical_to_image(pose_points, aspect_ratio), rest, bone_map,
-                                   diagnostics=ik_diagnostics, depth_offsets=depth_offsets)
+    ik_targets = _build_ik_targets(
+        _canonical_to_image(pose_points, aspect_ratio),
+        rest,
+        bone_map,
+        diagnostics=ik_diagnostics,
+        depth_offsets=depth_offsets,
+        left_hand_image=left_hand,
+        right_hand_image=right_hand,
+    )
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     root_translation = np.zeros((frame_count, 3), dtype=np.float32)
@@ -241,6 +243,7 @@ def solve_motion_from_pose(
         depth_observed=depth_observed.astype(np.uint8),
         ik_diagnostics_json=np.array(json.dumps(ik_diagnostics), dtype=np.str_),
         finger_direction_basis=np.array("PALM_ACROSS_FORWARD_NORMAL", dtype=np.str_),
+        finger_direction_conditioning_json=np.array(json.dumps(finger_conditioning), dtype=np.str_),
         finger_directions=finger_directions.astype(np.float32),
         finger_direction_valid=finger_direction_valid.astype(np.uint8),
         finger_direction_usable=finger_direction_usable.astype(np.uint8),
@@ -282,6 +285,7 @@ def solve_motion_from_pose(
             "body_only": body_only,
             "include_palms": include_palms,
             "include_fingers": include_fingers,
+            "finger_direction_conditioning": finger_conditioning,
             "neutral_hand_validation": neutral_validation,
             "ik_diagnostics": ik_diagnostics,
         },
@@ -696,6 +700,99 @@ def _unit_or_none(vector: np.ndarray) -> np.ndarray | None:
     return vector / length
 
 
+def _condition_finger_directions(
+    directions: np.ndarray,
+    observed: np.ndarray,
+    max_gap: int,
+    smoothing_radius: int,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Remove isolated local-shape spikes without mixing world hand rotations.
+
+    Only a single-frame excursion with two large steps and agreeing neighbors
+    is rejected. Sustained handshapes remain intact. Missing directions are
+    spherically interpolated only inside short bracketed gaps; the caller's
+    detector-observation mask is never changed by filling or conditioning.
+    """
+    source = np.asarray(directions, dtype=np.float64)
+    observed = np.asarray(observed, dtype=bool)
+    if source.ndim != 5 or source.shape[-1] != 3 or observed.shape != source.shape[:-1]:
+        raise ValueError("Finger direction and observation shapes do not match.")
+    frame_count = source.shape[0]
+    output = source.copy()
+    usable = observed.copy() & np.isfinite(source).all(axis=-1)
+    lengths = np.linalg.norm(source, axis=-1)
+    usable &= lengths > 1e-8
+    output = np.divide(output, lengths[..., None], out=np.full_like(output, np.nan),
+                       where=usable[..., None])
+    tracks = output.reshape(frame_count, -1, 3)
+    masks = usable.reshape(frame_count, -1)
+    corrections = []
+    interpolated_count = 0
+    radius = max(0, int(smoothing_radius))
+    for channel in range(tracks.shape[1]):
+        values = tracks[:, channel]
+        valid = masks[:, channel]
+        if radius:
+            # Evaluate all candidates against the original track, never against
+            # already repaired neighbors (which would spread a correction).
+            original = values.copy()
+            for frame in range(1, frame_count - 1):
+                if not valid[frame - 1:frame + 2].all():
+                    continue
+                before, current, after = original[frame - 1:frame + 2]
+                angles = np.arccos(np.clip([before @ current, current @ after, before @ after], -1.0, 1.0))
+                if min(angles[:2]) > np.radians(45.0) and angles[2] < np.radians(30.0):
+                    values[frame] = _slerp_direction(before, after, 0.5)
+                    side, finger, segment = np.unravel_index(channel, source.shape[1:-1])
+                    corrections.append({"frame": frame + 1, "side": int(side),
+                                        "finger": int(finger), "segment": int(segment),
+                                        "adjustment_degrees": float(np.degrees(np.arccos(np.clip(current @ values[frame], -1.0, 1.0))))})
+        frame = 0
+        while frame < frame_count:
+            if valid[frame]:
+                frame += 1
+                continue
+            first = frame
+            while frame < frame_count and not valid[frame]:
+                frame += 1
+            gap = frame - first
+            if first == 0 or frame == frame_count or gap > max(0, int(max_gap)):
+                continue
+            before, after = values[first - 1].copy(), values[frame].copy()
+            if before @ after < -0.9995:
+                continue  # Antipodal samples do not define a unique arc.
+            for offset in range(gap):
+                values[first + offset] = _slerp_direction(before, after, (offset + 1) / (gap + 1))
+                valid[first + offset] = True
+                interpolated_count += 1
+        if radius:
+            original = values.copy()
+            for frame in range(1, frame_count - 1):
+                # Preserve run endpoints and never smooth across an unfilled gap.
+                if not valid[frame - 1:frame + 2].all():
+                    continue
+                reach = 1
+                while reach < radius and frame - reach > 0 and frame + reach + 1 < frame_count:
+                    if not (valid[frame - reach - 1] and valid[frame + reach + 1]):
+                        break
+                    reach += 1
+                offsets = np.arange(-reach, reach + 1)
+                mean = np.sum(original[frame + offsets] * (reach + 1 - np.abs(offsets))[:, None], axis=0)
+                normalized = _unit_or_none(mean)
+                if normalized is not None:
+                    values[frame] = normalized
+    report = {
+        "method": "palm_local_isolated_spike_rejection_and_centered_direction_smoothing",
+        "status": "REVIEW" if corrections else "PASS",
+        "observed_samples": int(observed.sum()),
+        "interpolated_samples": interpolated_count,
+        "corrected_sample_count": len(corrections),
+        "sample_corrections": corrections,
+        "observation_mask_preserved": True,
+    }
+    return output, usable, report
+
+
 def _limit_finger_direction_steps(directions: np.ndarray, valid: np.ndarray, max_delta: float) -> np.ndarray:
     """Spherically limit each tracked local finger direction between frames."""
     output = np.asarray(directions, dtype=np.float64).copy()
@@ -900,9 +997,50 @@ def _set_identity(rotations, bone_names, canonical_name: str) -> None:
     _set_if_present(rotations, bone_names, canonical_name, np.array([1.0, 0.0, 0.0, 0.0]))
 
 
+def _torso_clearance_depth(
+    x: float,
+    y: float,
+    *,
+    hips_rest: np.ndarray,
+    shoulder_center: np.ndarray,
+    shoulder_width: float,
+    torso_height: float,
+    margin_ratio: float = 0.08,
+) -> float | None:
+    """Return minimum safe front depth (Z) for targets near the torso.
+
+    Uses an elliptical cross-section of the torso based on anatomical rest
+    proportions, ensuring wrists and hands never penetrate inside the body mesh.
+    """
+    y_hips = float(hips_rest[1])
+    y_shoulders = float(shoulder_center[1])
+    y_bottom = y_hips - 0.15 * torso_height
+    y_top = y_shoulders + 0.20 * torso_height
+    if y < y_bottom or y > y_top:
+        return None
+
+    t = float(np.clip((y - y_hips) / max(torso_height, 1e-4), 0.0, 1.0))
+    rx = shoulder_width * (0.42 + 0.04 * t)
+    dx = float(x - shoulder_center[0])
+    if abs(dx) >= rx:
+        return None
+
+    z_spine = (1.0 - t) * float(hips_rest[2]) + t * float(shoulder_center[2])
+    rz = shoulder_width * (0.23 + 0.09 * t)
+    radial = float(np.sqrt(max(0.0, 1.0 - (dx / rx) ** 2)))
+    surface_z = z_spine + rz * radial
+    return surface_z + shoulder_width * margin_ratio
+
+
 def _build_ik_targets(
-    pose_image: np.ndarray, rest: RestPose, bone_map: dict[str, str], *, diagnostics: dict | None = None,
+    pose_image: np.ndarray,
+    rest: RestPose,
+    bone_map: dict[str, str],
+    *,
+    diagnostics: dict | None = None,
     depth_offsets: np.ndarray | None = None,
+    left_hand_image: np.ndarray | None = None,
+    right_hand_image: np.ndarray | None = None,
 ) -> np.ndarray:
     frame_count = pose_image.shape[0]
     targets = np.zeros((frame_count, 4, 3), dtype=np.float64)
@@ -913,6 +1051,10 @@ def _build_ik_targets(
     avatar_shoulder_width = abs(left_shoulder_rest[0] - right_shoulder_rest[0])
     avatar_torso_height = abs(avatar_shoulder_center[1] - hips_rest[1])
     rest_depth = float((left_shoulder_rest[2] + right_shoulder_rest[2]) * 0.5)
+    arm_lengths = np.array([
+        sum(float(rest.bone_info[bone_map[f"{side}{part}"]]["length"]) for part in ("UpperArm", "ForeArm"))
+        for side in ("Left", "Right")
+    ])
     if depth_offsets is not None:
         depth_offsets = np.asarray(depth_offsets, dtype=np.float64)
         if depth_offsets.shape != (frame_count, 4) or not np.isfinite(depth_offsets).all():
@@ -948,6 +1090,9 @@ def _build_ik_targets(
             target_index = len(mapped)
             side = "Left" if target_index < 2 else "Right"
             shoulder_depth = float(rest.bone_info[bone_map[f"{side}UpperArm"]]["head_local"][2])
+            shoulder_origin = left_shoulder_rest if side == "Left" else right_shoulder_rest
+            side_reach = arm_lengths[0 if side == "Left" else 1]
+
             if depth_offsets is None:
                 # Legacy/helper callers without observations use explicit rest
                 # geometry, never a fixed number in arbitrary avatar units.
@@ -955,13 +1100,129 @@ def _build_ik_targets(
                 z = float(rest.bone_info[bone_map[f"{side}{part}"]]["head_local"][2])
             else:
                 z = shoulder_depth + depth_offsets[frame_index, target_index]
+
+            if target_index in (0, 2):  # Wrists
+                min_z = _torso_clearance_depth(
+                    x, y,
+                    hips_rest=hips_rest,
+                    shoulder_center=avatar_shoulder_center,
+                    shoulder_width=avatar_shoulder_width,
+                    torso_height=avatar_torso_height,
+                    margin_ratio=0.08,
+                )
+                if min_z is not None:
+                    z = max(z, min_z)
+                # Keep target wrist within comfortable reach interval
+                max_reach = side_reach * 0.98
+                lateral_sq = (x - shoulder_origin[0]) ** 2 + (y - shoulder_origin[1]) ** 2
+                if lateral_sq < max_reach ** 2:
+                    max_z = shoulder_origin[2] + float(np.sqrt(max_reach ** 2 - lateral_sq))
+                    z = min(z, max_z)
+            elif target_index in (1, 3):  # Elbows
+                min_z = _torso_clearance_depth(
+                    x, y,
+                    hips_rest=hips_rest,
+                    shoulder_center=avatar_shoulder_center,
+                    shoulder_width=avatar_shoulder_width,
+                    torso_height=avatar_torso_height,
+                    margin_ratio=0.01,
+                )
+                if min_z is not None:
+                    z = max(z, min_z)
+
             mapped.append(np.array([x, y, z], dtype=np.float64))
         targets[frame_index] = np.array(mapped, dtype=np.float64)
         previous = targets[frame_index].copy()
-    arm_lengths = np.array([
-        sum(float(rest.bone_info[bone_map[f"{side}{part}"]]["length"]) for part in ("UpperArm", "ForeArm"))
-        for side in ("Left", "Right")
-    ])
+
+    # --- Wrist proximity correction ---
+    # Independent shoulder-based scaling can amplify the lateral gap between
+    # wrists when hands are close together (e.g., ISL letter signs). When hands
+    # are close in image space (e.g., thumb tips touching), pull both wrists inward
+    # toward their midpoint to restore the observed closeness on the avatar.
+    pull_factors = np.zeros(frame_count, dtype=np.float64)
+    proximity_diagnostics: list[dict] = []
+
+    for frame_index in range(frame_count):
+        frame = pose_image[frame_index]
+        if not np.isfinite(frame[[11, 12, 15, 16], :2]).all():
+            continue
+        source_sw = abs(float(frame[11, 0] - frame[12, 0]))
+        if source_sw < 0.03:
+            continue
+
+        has_hands = False
+        if left_hand_image is not None and right_hand_image is not None:
+            lh = left_hand_image[frame_index, :, :2]
+            rh = right_hand_image[frame_index, :, :2]
+            if np.isfinite(lh).all() and np.isfinite(rh).all():
+                diff = lh[:, None, :] - rh[None, :, :]
+                hand_dist = float(np.min(np.linalg.norm(diff, axis=-1)))
+                hand_ratio = hand_dist / source_sw
+                has_hands = True
+                # When hands are close (< 0.35 shoulder widths), pull wrists inward.
+                # Max pull is 0.48 when hands are touching (hand_ratio ~ 0).
+                if hand_ratio < 0.35:
+                    pull_factors[frame_index] = 0.48 * (1.0 - hand_ratio / 0.35)
+
+        if not has_hands:
+            # Fallback using pose wrist distance
+            source_wrist_dx = float(frame[15, 0] - frame[16, 0])
+            source_wrist_dy = float(frame[15, 1] - frame[16, 1])
+            source_wrist_dist = np.sqrt(source_wrist_dx ** 2 + source_wrist_dy ** 2)
+            source_ratio = source_wrist_dist / source_sw
+            if source_ratio < 0.85:
+                pull_factors[frame_index] = 0.40 * max(0.0, 1.0 - (source_ratio - 0.25) / 0.60)
+
+    # Smooth pull factors temporally to avoid jitter
+    if frame_count > 4:
+        pull_factors = smooth_landmarks_centered(pull_factors[:, None], radius=2)[:, 0]
+
+    for frame_index in range(frame_count):
+        blend = pull_factors[frame_index]
+        if blend <= 0.0:
+            continue
+        lw = targets[frame_index, 0]
+        rw = targets[frame_index, 2]
+        old_lateral = float(np.sqrt((lw[0] - rw[0]) ** 2 + (lw[1] - rw[1]) ** 2))
+        midpoint_x = (lw[0] + rw[0]) * 0.5
+        midpoint_y = (lw[1] + rw[1]) * 0.5
+        targets[frame_index, 0, 0] = lw[0] - (lw[0] - midpoint_x) * blend
+        targets[frame_index, 0, 1] = lw[1] - (lw[1] - midpoint_y) * blend
+        targets[frame_index, 2, 0] = rw[0] - (rw[0] - midpoint_x) * blend
+        targets[frame_index, 2, 1] = rw[1] - (rw[1] - midpoint_y) * blend
+
+        # Ensure torso clearance is maintained after inward pull
+        for wrist_idx in (0, 2):
+            min_z = _torso_clearance_depth(
+                targets[frame_index, wrist_idx, 0],
+                targets[frame_index, wrist_idx, 1],
+                hips_rest=hips_rest,
+                shoulder_center=avatar_shoulder_center,
+                shoulder_width=avatar_shoulder_width,
+                torso_height=avatar_torso_height,
+                margin_ratio=0.08,
+            )
+            if min_z is not None:
+                targets[frame_index, wrist_idx, 2] = max(targets[frame_index, wrist_idx, 2], min_z)
+
+        if len(proximity_diagnostics) < 8:
+            new_lateral = float(np.sqrt(
+                (targets[frame_index, 0, 0] - targets[frame_index, 2, 0]) ** 2 +
+                (targets[frame_index, 0, 1] - targets[frame_index, 2, 1]) ** 2
+            ))
+            proximity_diagnostics.append({
+                "frame": frame_index,
+                "correction_blend": float(blend),
+                "old_lateral": old_lateral,
+                "new_lateral": new_lateral,
+            })
+
+    if diagnostics is not None:
+        diagnostics["wrist_proximity_correction"] = {
+            "corrected_frames": int(np.sum(pull_factors > 0.01)),
+            "max_pull_blend": float(np.max(pull_factors)) if len(pull_factors) else 0.0,
+            "samples": proximity_diagnostics,
+        }
     conditioned, pole_diagnostics = _condition_arm_pole_targets(
         targets, np.array([left_shoulder_rest, right_shoulder_rest]), arm_lengths,
     )
